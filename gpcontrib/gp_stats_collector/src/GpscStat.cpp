@@ -40,19 +40,57 @@ extern "C" {
 
 namespace
 {
+
+/*
+ * ProtectedData -- spin-lock-protected wrapper around the GpscStat counters.
+ *
+ * Lives in a shared-memory segment so all backends on the same segment host
+ * contribute to the same counters.
+ */
 struct ProtectedData
 {
-	slock_t mutex;
+	slock_t        mutex;
 	GpscStat::Data data;
 };
-shmem_startup_hook_type prev_shmem_startup_hook = NULL;
-ProtectedData *data = nullptr;
 
-void
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+
+/*
+ * prev_shmem_request_hook is only relevant on PostgreSQL 15+, where the
+ * shmem request phase is separate from the startup phase.
+ */
+#if PG_VERSION_NUM >= 150000
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+
+/*
+ * gpsc_shmem_request -- request shared memory space.
+ *
+ * Installed as shmem_request_hook on PG15+.  Chains to the previous hook
+ * before adding our own request.
+ */
+static void
+gpsc_shmem_request()
+{
+	if (prev_shmem_request_hook)
+		prev_shmem_request_hook();
+	RequestAddinShmemSpace(sizeof(ProtectedData));
+}
+#endif  /* PG_VERSION_NUM >= 150000 */
+
+static ProtectedData *data = nullptr;
+
+/*
+ * gpsc_shmem_startup -- attach to (or initialise) the GpscStat shared segment.
+ *
+ * Installed as shmem_startup_hook.  On first call (found == false) zeroes the
+ * counters and initialises the spin lock.  Always chains to the previous hook.
+ */
+static void
 gpsc_shmem_startup()
 {
 	if (prev_shmem_startup_hook)
 		prev_shmem_startup_hook();
+
 	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
 	bool found;
 	data = reinterpret_cast<ProtectedData *>(
@@ -65,10 +103,16 @@ gpsc_shmem_startup()
 	LWLockRelease(AddinShmemInitLock);
 }
 
+/*
+ * LockGuard -- RAII wrapper around a SpinLock.
+ *
+ * Acquires the spin lock on construction and releases it on destruction,
+ * ensuring the lock is always released even if an exception is thrown.
+ */
 class LockGuard
 {
 public:
-	LockGuard(slock_t *mutex) : mutex_(mutex)
+	explicit LockGuard(slock_t *mutex) : mutex_(mutex)
 	{
 		SpinLockAcquire(mutex_);
 	}
@@ -80,24 +124,51 @@ public:
 private:
 	slock_t *mutex_;
 };
+
 }  // namespace
 
+/*
+ * GpscStat::init -- install shmem hooks during shared_preload_libraries phase.
+ *
+ * Must be called while process_shared_preload_libraries_in_progress is true.
+ * On PostgreSQL 14 and earlier, shared memory is requested here directly via
+ * RequestAddinShmemSpace().  On PostgreSQL 15+ a separate shmem_request_hook
+ * handles the request.
+ */
 void
 GpscStat::init()
 {
 	if (!process_shared_preload_libraries_in_progress)
 		return;
+
+#if PG_VERSION_NUM >= 150000
+	prev_shmem_request_hook = shmem_request_hook;
+	shmem_request_hook = gpsc_shmem_request;
+#else
 	RequestAddinShmemSpace(sizeof(ProtectedData));
+#endif
+
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = gpsc_shmem_startup;
 }
 
+/*
+ * GpscStat::deinit -- restore shmem hooks to their previous values.
+ *
+ * Called from hooks_deinit().
+ */
 void
 GpscStat::deinit()
 {
+#if PG_VERSION_NUM >= 150000
+	shmem_request_hook = prev_shmem_request_hook;
+#endif
 	shmem_startup_hook = prev_shmem_startup_hook;
 }
 
+/*
+ * GpscStat::reset -- zero all counters in the shared segment.
+ */
 void
 GpscStat::reset()
 {
@@ -105,6 +176,12 @@ GpscStat::reset()
 	data->data = GpscStat::Data();
 }
 
+/*
+ * GpscStat::report_send -- record a successful message send.
+ *
+ * Parameters:
+ *   msg_size -- size of the sent protobuf message in bytes
+ */
 void
 GpscStat::report_send(int32_t msg_size)
 {
@@ -114,6 +191,9 @@ GpscStat::report_send(int32_t msg_size)
 		std::max(msg_size, data->data.max_message_size);
 }
 
+/*
+ * GpscStat::report_bad_connection -- record a failed UDS connection attempt.
+ */
 void
 GpscStat::report_bad_connection()
 {
@@ -122,6 +202,12 @@ GpscStat::report_bad_connection()
 	data->data.failed_connects++;
 }
 
+/*
+ * GpscStat::report_bad_send -- record a failed send on an established connection.
+ *
+ * Parameters:
+ *   msg_size -- size of the message that could not be sent
+ */
 void
 GpscStat::report_bad_send(int32_t msg_size)
 {
@@ -132,6 +218,9 @@ GpscStat::report_bad_send(int32_t msg_size)
 		std::max(msg_size, data->data.max_message_size);
 }
 
+/*
+ * GpscStat::report_error -- record any other error not covered by the above.
+ */
 void
 GpscStat::report_error()
 {
@@ -140,6 +229,12 @@ GpscStat::report_error()
 	data->data.failed_other++;
 }
 
+/*
+ * GpscStat::get_stats -- return a snapshot of all counters.
+ *
+ * The snapshot is taken under the spin lock and returned by value, so the
+ * caller sees a consistent view.
+ */
 GpscStat::Data
 GpscStat::get_stats()
 {
@@ -147,6 +242,12 @@ GpscStat::get_stats()
 	return data->data;
 }
 
+/*
+ * GpscStat::loaded -- return true when the shared segment has been mapped.
+ *
+ * Returns false before shmem_startup_hook has run (e.g. if the extension was
+ * not loaded via shared_preload_libraries).
+ */
 bool
 GpscStat::loaded()
 {

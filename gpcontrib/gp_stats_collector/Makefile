@@ -11,6 +11,7 @@ CPP_OBJS = $(patsubst %.cpp,%.o,$(wildcard src/*.cpp src/log/*.cpp src/memory/*.
 OBJS     = $(C_OBJS) $(CPP_OBJS) $(PROTO_OBJS)
 
 PG_CXXFLAGS += -Werror -Wall -Wno-unused-but-set-variable -std=c++17 -Isrc/protos -Isrc -Iinclude -DGPBUILD
+PG_CPPFLAGS += -I$(libpq_srcdir) -Isrc/protos -Isrc -Iinclude
 SHLIB_LINK += -lprotobuf -lstdc++
 EXTRA_CLEAN = src/protos
 

@@ -45,3 +45,25 @@ An extension for collecting query execution metrics and reporting them to an ext
 -   **User Filtering:** To exclude activity from certain roles, add them to the comma-separated list in `gpsc.ignored_users_list`.
 -   **Trimming plans:** Query texts and execution plans are trimmed based on `gpsc.max_text_size` and `gpsc.max_plan_size` (default: 1024KB). For now, it is not recommended to set these GUCs higher than 1024KB.
 -   **Analyze collection:** Analyze is sent if execution time exceeds `gpsc.min_analyze_time`, which is 10 seconds by default. Analyze is collected if `gpsc.enable_analyze` is true.
+
+### Runtime Query State (`pg_query_state`)
+
+On-demand inspection of the live execution state of another running backend. The target's active plan tree is walked across the coordinator (QD) and every segment (QE), collecting per-node instrumentation, without waiting for the query to finish. This is the signal-only variant: per-node samples are written to the server log rather than sent to the UDS sink.
+
+The functions live in the `gpsc` schema (extension version 1.2).
+
+#### 1. `pg_query_state(pid)`
+-   **What:** Triggers runtime per-node collection for the query running on backend `pid`. Fans a poll out to every participating QE and to the QD; each backend walks its plan tree and logs a per-node snapshot. Fire-and-forget: returns `void`.
+-   **GUC:** `pg_query_state.enable`.
+
+#### 2. `pg_query_state_backends(pid)`
+-   **What:** Lists the QE backends participating in the query running on backend `pid`, as `(segid, pid)` rows. Returns an empty set when the target is not running a query or has the module disabled.
+-   **GUC:** `pg_query_state.enable`.
+
+#### 3. `cbdb_mpp_query_state(gp_segment_pid[])`
+-   **What:** QE-side dispatch target used internally by `pg_query_state()`; not intended for direct use.
+
+### Runtime Query State Configuration
+-   **Enable:** `pg_query_state.enable` (default `on`) turns the executor hooks and signal handling on or off. Additional GUCs `pg_query_state.enable_timing` and `pg_query_state.enable_buffers` control the level of instrumentation collected.
+-   **Permissions:** The functions are granted to `PUBLIC`, but access is checked in the server: a caller may poll a backend only if it is a superuser or owns the target query. This lets monitoring agents run under a non-superuser role while still preventing one role from observing another's queries.
+-   **Preload:** The module registers custom signal handlers at startup, so `gp_stats_collector` must be listed in `shared_preload_libraries`.

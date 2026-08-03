@@ -31,6 +31,7 @@
 #include "utils/builtins.h"
 
 #include "hook_wrappers.h"
+#include "pg_query_state/pg_query_state.h"
 
 PG_MODULE_MAGIC;
 
@@ -48,6 +49,12 @@ PG_FUNCTION_INFO_V1(gpsc_test_uds_stop_server);
 void
 _PG_init(void)
 {
+	/*
+	 * Initialise the pg_query_state signal infrastructure unconditionally.
+	 * It registers custom ProcSignal handlers and shared memory that must be
+	 * set up during shared_preload_libraries processing.
+	 */
+	pg_qs_init();
 	if (Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_EXECUTE)
 		hooks_init();
 }
