@@ -122,8 +122,8 @@ CREATE TYPE gpsc.gp_segment_pid AS (
 
 -- pg_query_state(pid): trigger runtime per-node collection for the query
 -- running on backend `pid`.  Fans QueryStatePollReason out to every QE via
--- cbdb_mpp_query_state; each matching QE walks its plan tree and logs a
--- per-node snapshot.  Fire-and-forget: returns void.
+-- cbdb_mpp_query_state; each matching QE walks its plan tree and pushes a
+-- per-node batch to its local yagpcc over UDS.  Fire-and-forget: returns void.
 CREATE FUNCTION gpsc.pg_query_state(pid int)
 RETURNS SETOF void
 AS 'MODULE_PATHNAME', 'pg_query_state'
@@ -138,7 +138,9 @@ AS 'MODULE_PATHNAME', 'cbdb_mpp_query_state'
 LANGUAGE C VOLATILE;
 
 -- pg_query_state_backends(pid): list the QE backends participating in the
--- query running on backend `pid`, as (segid, pid) rows.
+-- query running on backend `pid`, as (segid, pid) rows.  yagpcc uses the row
+-- count as the "expected batches" barrier: per-node collection is complete
+-- once a batch has arrived from every listed backend.
 CREATE FUNCTION gpsc.pg_query_state_backends(pid int)
 RETURNS TABLE(segid int, pid int)
 AS 'MODULE_PATHNAME', 'pg_query_state_backends'
