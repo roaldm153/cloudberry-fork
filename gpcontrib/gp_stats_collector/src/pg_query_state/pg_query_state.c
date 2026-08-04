@@ -347,8 +347,16 @@ pg_qs_executor_start(QueryDesc *queryDesc, int eflags)
 			queryDesc->instrument_options |= INSTRUMENT_BUFFERS;
 
 		INSTR_TIME_SET_CURRENT(starttime);
-		queryDesc->showstatctx =
-			cdbexplain_showExecStatsBegin(queryDesc, starttime);
+
+		/*
+		 * cdbexplain_showExecStatsBegin() aggregates QE stats on the QD and
+		 * asserts Gp_role != GP_ROLE_EXECUTE, so it must run on the dispatcher
+		 * only.  QE backends still get instrument_options above, which is all
+		 * the per-node walker reads.
+		 */
+		if (Gp_role == GP_ROLE_DISPATCH)
+			queryDesc->showstatctx =
+				cdbexplain_showExecStatsBegin(queryDesc, starttime);
 		queryDesc->totaltime = InstrAlloc(1, INSTRUMENT_ALL, false);
 	}
 
