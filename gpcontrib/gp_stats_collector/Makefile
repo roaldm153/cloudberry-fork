@@ -3,7 +3,7 @@ EXTENSION  = gp_stats_collector
 DATA       = $(wildcard *--*.sql)
 REGRESS    = gpsc_cursors gpsc_dist gpsc_select gpsc_utf8_trim gpsc_utility gpsc_guc_cache gpsc_uds gpsc_locale
 
-PROTO_BASES = gpsc_plan gpsc_metrics gpsc_set_service
+PROTO_BASES = gpsc_plan gpsc_metrics gpsc_set_service yagpcc_metrics yagpcc_plan yagpcc_set_per_node
 PROTO_OBJS  = $(patsubst %,src/protos/%.pb.o,$(PROTO_BASES))
 
 C_OBJS   = $(patsubst %.c,%.o,$(wildcard src/*.c src/*/*.c))

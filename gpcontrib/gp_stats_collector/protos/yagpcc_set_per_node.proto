@@ -1,0 +1,101 @@
+/**
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+
+import "protos/yagpcc_plan.proto";
+
+package yagpcc;
+
+/*
+ * SetPerNodeBatchReq -- one whole plan-tree snapshot from a single backend.
+ *
+ * Sent once per walker pass (SendQueryState signal or pg_qs_executor_end),
+ * carrying every observed plan node in one message.  A backend opens one UDS
+ * connection and sends this batch instead of connect+send+close per node.  The
+ * shared query_key, segment_key and datetime are hoisted out of every node.
+ *
+ * Wire transport: UDSConnector::report_per_node_batch() with the 8-byte
+ * extended protocol header (payload_size | 0x80000000, request_type=1,
+ * reserved=0).
+ *
+ * This message MUST stay byte-identical to the yagpcc-side definition in
+ * api/proto/agent_segment/yagpcc_set_service.proto.
+ */
+message SetPerNodeBatchReq {
+    google.protobuf.Timestamp    datetime    = 1;
+    QueryKey                     query_key   = 2;
+    SegmentKey                   segment_key = 3;
+    repeated BatchNode           nodes       = 4;
+}
+
+/*
+ * BatchNode -- one plan node inside a SetPerNodeBatchReq.
+ *
+ * Deliberately flat (no NodeMetrics wrapper) so the two repos can keep the
+ * message trivially wire-identical without sharing a metrics wrapper type.
+ * Fields mirror GpscNodeSample minus the hoisted identity keys.
+ */
+message BatchNode {
+    int32          plan_node_id        = 1;
+    int32          parent_plan_node_id = 2;
+    int32          node_type           = 3;   /* raw NodeTag value */
+    int32          slice_id            = 4;
+    double         plan_rows           = 5;   /* planner estimate */
+    int32          relation_oid        = 6;   /* scan relation OID, 0 otherwise */
+    double         ntuples             = 7;
+    double         tuplecount          = 8;
+    double         nloops              = 9;
+    double         startup             = 10;
+    double         total               = 11;
+    double         firsttuple          = 12;
+    uint64         shared_blks_hit     = 13;
+    uint64         shared_blks_read    = 14;
+    PlanNodeStatus node_status         = 15;
+    bool           eof                 = 16;
+    /* executed_at: source-side wall-clock when gpsc computed this node. Drives
+     * per-node rate (tuples/sec) and time-since-init downstream; compared only
+     * within one (node, slice, segment) -- timestamps differ per segment host. */
+    google.protobuf.Timestamp executed_at = 17;
+    /* per-node spill, straight from GP Instrumentation. Reliable at node
+     * finalize; a mid-run snapshot is a lower bound (esp. Sort/HashJoin). */
+    bool           workfile_created    = 18;
+    int64          workmem_used        = 19;   /* bytes of work_mem actually used */
+    int64          workmem_wanted      = 20;   /* bytes needed to avoid spill; >0 == spilled */
+}
+
+/*
+ * SetQueryPlanReq -- coordinator-only ExplainPrintPlan document for a query.
+ *
+ * Emitted once per poll from the QD (Gp_role == GP_ROLE_DISPATCH) via the
+ * extended UDS protocol with request_type=2.  Carries the full deparsed plan
+ * (expressions, costs, Settings) that the compact per-node stats cannot
+ * reconstruct.  Keyed by query_key only; it is a whole-query artifact, not
+ * per-segment.  Last write wins on the yagpcc side.
+ *
+ * This message MUST stay byte-identical to the yagpcc-side definition in
+ * api/proto/agent_segment/yagpcc_set_service.proto.
+ */
+message SetQueryPlanReq {
+    google.protobuf.Timestamp    datetime  = 1;
+    QueryKey                     query_key = 2;
+    string                       plan_doc  = 3;   /* ExplainPrintPlan output */
+    int32                        format    = 4;   /* ExplainFormat: 0=text 1=xml 2=json 3=yaml */
+}
