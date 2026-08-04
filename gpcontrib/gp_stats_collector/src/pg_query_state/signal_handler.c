@@ -25,7 +25,9 @@
  *
  *   SendQueryState()    -- fired when QueryStatePollReason is received.
  *                          Walks the active plan tree, collects per-node stats,
- *                          and writes them to the PostgreSQL LOG.
+ *                          logs them, then pushes the whole snapshot to the
+ *                          yagpcc UDS sink (and, on the coordinator, the
+ *                          deparsed plan document).
  *   SendCurrentUserId() -- fired when UserIdPollReason is received.
  *                          Sends the current effective user-id through shm_mq.
  *   SendCdbComponents() -- fired when BackendInfoPollReason is received (QD only).
@@ -52,6 +54,7 @@
 #include <unistd.h>
 
 #include "pg_query_state.h"
+#include "PlanNodeEmitter.h"
 
 #include "cdb/cdbexplain.h"
 #include "cdb/cdbutil.h"
@@ -59,13 +62,31 @@
 #include "libpq-fe.h"
 #include "cdb/cdbconn.h"
 #include "commands/explain.h"
+#include "executor/executor.h"
 #include "miscadmin.h"
+#include "nodes/execnodes.h"
+#include "nodes/plannodes.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "storage/lock.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
+#include "utils/timestamp.h"
 #include "libpq/pqmq.h"
+
+/*
+ * Identity of the most recent coordinator plan-doc push, used to rate-limit
+ * SetQueryPlanReq: SendQueryState() re-sends the deparsed plan only when the
+ * query key changes or PLAN_DOC_RESEND_INTERVAL_MS has elapsed.
+ */
+static struct
+{
+	int32_t		tmid;
+	int32_t		ssid;
+	int32_t		ccnt;
+	TimestampTz at;
+} last_sent_query_key;
 
 /*
  * shm_mq_send_nonblocking -- attempt to send nbytes through mqh up to
@@ -288,15 +309,33 @@ qs_get_node_stats(PlanState *planstate, QsWalkerContext *qs_walker_ctx)
 	if (planstate->instrument)
 	{
 		Instrumentation *instr = planstate->instrument;
+		double			 eff_nloops;
 
 		if (qs_walker_ctx->finalize)
 		{
 			InstrEndLoop(instr);
 		}
 
+		/*
+		 * Effective number of completed passes.  instr->nloops counts only the
+		 * loops closed by InstrEndLoop, which for a top-level node does not fire
+		 * until executor shutdown, so a scan that has already exhausted its
+		 * single pass mid-query still reads 0 -- any nloops-based "done" check
+		 * stays blind to a scan we can otherwise see has ended.  instr->eof marks
+		 * that the current pass has finished producing, so fold it in here: this
+		 * surfaces "one pass done" the instant a scan hits eof, and gives a
+		 * rescanning node its in-progress pass too.  We must not call
+		 * InstrEndLoop ourselves to force this -- it mutates the live query's
+		 * instrumentation.  At finalize InstrEndLoop (above) has already closed
+		 * the loop, so eof must not be counted a second time there.
+		 */
+		eff_nloops = instr->nloops;
+		if (!qs_walker_ctx->finalize && instr->eof)
+			eff_nloops += 1;
+
 		nodestat->ntuples    = instr->ntuples + instr->tuplecount; /* include in-progress loop */
 		nodestat->tuplecount = instr->tuplecount;
-		nodestat->nloops     = instr->nloops;
+		nodestat->nloops     = eff_nloops;
 		nodestat->startup    = instr->startup;
 		nodestat->total      = instr->total;
 		nodestat->firsttuple = instr->firsttuple;
@@ -306,18 +345,23 @@ qs_get_node_stats(PlanState *planstate, QsWalkerContext *qs_walker_ctx)
 
 		/*
 		 * eof lets a consumer tell a node that has finished producing (running
-		 * but exhausted for this cycle) from one still actively pulling.  Only
-		 * meaningful while running; nloops>0 / not-running already imply done.
+		 * but exhausted for this cycle) from one still actively pulling.
 		 */
 		nodestat->eof = instr->eof;
 
+		/*
+		 * A node that hit eof has finished producing for this cycle even if
+		 * instr->running still reads true between fetches and InstrEndLoop has
+		 * not closed the loop yet -- treat it as done.  eff_nloops already folds
+		 * that pass in, so it drives the FINISHED test.
+		 */
 		if (instr->running && !instr->eof)
 			nodestat->node_status = QS_NODE_STATUS_EXECUTING;
-		else if (instr->nloops > 0)
+		else if (eff_nloops > 0)
 			nodestat->node_status = QS_NODE_STATUS_FINISHED;
 		else
 			nodestat->node_status = QS_NODE_STATUS_INITIALIZED;
-		
+
 		/*
 		 * Per-node spill, from the GP-specific Instrumentation fields. These are
 		 * populated by the node executors: workfileCreated live at spill for
@@ -444,14 +488,85 @@ runtime_explain(void)
 }
 
 /*
+ * emit_node_batch -- push a whole plan-tree snapshot as one SetPerNodeBatchReq.
+ *
+ * Flattens the List<GpscNodeSample *> into a contiguous array and hands it to
+ * the C++ emitter, which opens a single UDS connection for the whole backend
+ * instead of one connection per node.  A NULL or empty list is a no-op.
+ *
+ * The caller is responsible for calling gpsc_qs_sync_config() beforehand.
+ */
+void
+emit_node_batch(List *per_node_stats)
+{
+	GpscNodeSample **arr;
+	ListCell        *lc;
+	int              n = list_length(per_node_stats);
+	int              i = 0;
+
+	if (n == 0)
+		return;
+
+	arr = (GpscNodeSample **) palloc(n * sizeof(GpscNodeSample *));
+	foreach(lc, per_node_stats)
+		arr[i++] = (GpscNodeSample *) lfirst(lc);
+
+	gpsc_emit_plan_batch(arr, n);
+}
+
+/*
+ * build_plan_doc -- render the active query's plan via ExplainPrintPlan.
+ *
+ * Produces the full deparsed plan document (expressions, costs, Settings) in
+ * the requested ExplainFormat.  ExplainBeginOutput/ExplainEndOutput and the
+ * enclosing "Query" group frame the output so JSON/XML/YAML come out
+ * well-formed: ExplainPrintPlan on its own renders only the inner "Plan"
+ * property, so without the group the non-text formats are an unwrapped
+ * fragment no parser accepts.  The framing lives here, outside
+ * ExplainPrintPlan, so that function is left untouched.
+ *
+ * Returns a palloc'd string in the current context, or NULL when queryDesc is
+ * NULL.  Intended for the coordinator (QD) only: on a QE the plan subtree can
+ * reach child PlanStates from other slices that are not instantiated here.
+ */
+static char *
+build_plan_doc(QueryDesc *queryDesc, ExplainFormat format)
+{
+	ExplainState   *es;
+	volatile int32	savedInterruptHoldoffCount;
+
+	if (queryDesc == NULL)
+		return NULL;
+
+	savedInterruptHoldoffCount = InterruptHoldoffCount;
+	es = NewExplainState();
+	es->format  = format;
+	es->verbose = true;
+	es->costs   = true;
+	es->runtime = true;
+
+	ExplainBeginOutput(es);
+	ExplainOpenGroup("Query", NULL, true, es);
+	ExplainPrintPlan(es, queryDesc);
+	ExplainCloseGroup("Query", NULL, true, es);
+	ExplainEndOutput(es);
+	InterruptHoldoffCount = savedInterruptHoldoffCount;
+
+	return es->str->data;
+}
+
+/*
  * SendQueryState -- handler for QueryStatePollReason.
  *
  * Fired asynchronously when another backend (or the monitoring function)
  * sends QueryStatePollReason to this process.
  *
- * Collects a plan-tree snapshot via runtime_explain() and emits it to the
- * PostgreSQL LOG via qs_debug_node_stats().  This branch does NOT push data
- * to any external sink.
+ * Collects a plan-tree snapshot via runtime_explain(), logs it via
+ * qs_debug_node_stats(), then syncs the emitter config and pushes the whole
+ * snapshot to the yagpcc UDS sink via emit_node_batch().  On the coordinator
+ * it additionally pushes the deparsed plan document (SetQueryPlanReq), which
+ * the compact per-node stats cannot reconstruct; that push is rate-limited to
+ * once per PLAN_DOC_RESEND_INTERVAL_MS per query.
  *
  * The entire body runs inside a dedicated MemoryContext that is deleted on
  * exit, preventing any leaks into the backend's long-lived contexts.  Any
@@ -485,6 +600,53 @@ SendQueryState(void)
 	{
 		qs_result = runtime_explain();
 		qs_debug_node_stats(qs_result);
+
+		gpsc_qs_sync_config();
+
+		/*
+		 * Emit the whole plan-tree snapshot as a single batch: one UDS
+		 * connection per backend instead of connect+send+close per node.
+		 */
+		emit_node_batch(qs_result);
+
+		/*
+		 * Coordinator-only: push the full ExplainPrintPlan document so yagpcc
+		 * has the deparsed structure (expressions, costs, Settings) that the
+		 * compact per-node stats cannot reconstruct.  On a QE the plan subtree
+		 * may reach child PlanStates from other slices that are not
+		 * instantiated here, so restrict this to the QD.  Rate-limited to once
+		 * per PLAN_DOC_RESEND_INTERVAL_MS per query so repeated polls of a
+		 * long-running query do not resend the unchanging plan every time.
+		 */
+		if (Gp_role == GP_ROLE_DISPATCH)
+		{
+			int32_t	tmid;
+			bool	is_same_query;
+			bool	is_stale;
+
+			gp_gettmid(&tmid);
+			is_same_query = (tmid == last_sent_query_key.tmid &&
+							 gp_session_id == last_sent_query_key.ssid &&
+							 gp_command_count == last_sent_query_key.ccnt);
+			is_stale = !is_same_query ||
+				TimestampDifferenceExceeds(last_sent_query_key.at,
+										   GetCurrentTimestamp(),
+										   PLAN_DOC_RESEND_INTERVAL_MS);
+
+			if (is_stale)
+			{
+				char *plan_doc = build_plan_doc(get_toppest_query(),
+												EXPLAIN_FORMAT_JSON);
+
+				gpsc_emit_query_plan(tmid, gp_session_id, gp_command_count,
+									 plan_doc, EXPLAIN_FORMAT_JSON);
+
+				last_sent_query_key.tmid = tmid;
+				last_sent_query_key.ssid = gp_session_id;
+				last_sent_query_key.ccnt = gp_command_count;
+				last_sent_query_key.at   = GetCurrentTimestamp();
+			}
+		}
 	}
 	PG_CATCH();
 	{

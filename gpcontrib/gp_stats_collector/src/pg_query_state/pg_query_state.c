@@ -26,14 +26,16 @@
  *       QueryStatePollReason  -> SendQueryState()
  *       UserIdPollReason      -> SendCurrentUserId()
  *       BackendInfoPollReason -> SendCdbComponents()
- *   - GUC variables: pg_query_state.enable / enable_timing / enable_buffers.
+ *   - GUC variables: pg_query_state.enable / enable_timing / enable_buffers /
+ *                    emit_on_finish.
  *   - Executor lifecycle hooks (start/run/finish/end) that maintain the
  *     QueryDescStack and enable instrumentation on the top-level query.
  *   - A requestor-side helper: shm_mq_receive_with_timeout().
  *
- * This is the "signal-only" variant: it does NOT push plan-node data to any
- * upstream sink (no UDS, no protobuf).  The executor_end hook merely walks
- * the plan tree and writes a LOG entry for debugging.
+ * The executor_end hook walks the plan tree and, when pg_qs_emit_on_finish is
+ * true, pushes the collected per-node stats to the yagpcc UDS sink via
+ * gpsc_emit_plan_batch().  The stats are always written to the server log for
+ * debugging regardless of that GUC.
  *
  * Portions derived from pg_query_state
  * (https://github.com/postgrespro/pg_query_state), under the PostgreSQL
@@ -47,6 +49,7 @@
  */
 
 #include "pg_query_state.h"
+#include "PlanNodeEmitter.h"
 
 #include "access/htup_details.h"
 #include "access/xact.h"
@@ -89,6 +92,13 @@ bool pg_qs_timing  = false;
 
 /* Collect buffer usage via Instrumentation.bufusage. */
 bool pg_qs_buffers = true;
+
+/*
+ * When true, the executor_end hook pushes per-node stats to the yagpcc UDS
+ * sink at the end of every query execution.  Set to false to keep the signal
+ * handler active while suppressing the automatic end-of-query push.
+ */
+bool pg_qs_emit_on_finish = true;
 
 /*
  * Rolling counter incremented for every QueryDesc pushed onto the stack.
@@ -303,6 +313,15 @@ pg_qs_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("pg_query_state.emit_on_finish",
+							 "Push per-node stats to the yagpcc UDS sink at query end.",
+							 NULL,
+							 &pg_qs_emit_on_finish,
+							 true,
+							 PGC_SUSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = pg_qs_shmem_startup;
 
@@ -392,7 +411,10 @@ pg_qs_executor_finish(QueryDesc *queryDesc)
  * pg_qs_executor_end -- called when executor resources are released.
  *
  * Walks the plan tree with instrumentation finalized (InstrEndLoop) and writes
- * the collected per-node stats to the server log.
+ * the collected per-node stats to the server log.  When pg_qs_emit_on_finish
+ * is true, also pushes the stats to the yagpcc UDS sink via
+ * gpsc_emit_plan_batch(); the walker has already run with finalize=true, so
+ * every node reports as FINISHED.
  */
 void
 pg_qs_executor_end(QueryDesc *queryDesc)
@@ -407,6 +429,12 @@ pg_qs_executor_end(QueryDesc *queryDesc)
 	qs_planstate_walker(queryDesc->planstate, qs_get_node_stats,
 						qs_walker_ctx, 0);
 	qs_debug_node_stats(qs_walker_ctx->per_node_stats);
+
+	if (pg_qs_emit_on_finish)
+	{
+		gpsc_qs_sync_config();
+		emit_node_batch(qs_walker_ctx->per_node_stats);
+	}
 }
 
 /*

@@ -87,6 +87,14 @@ extern "C" {
 #define PART_RCV_DELAY      100   /* ms */
 
 /*
+ * Minimum interval between coordinator plan-doc pushes for the same query.
+ * SendQueryState() re-sends the ExplainPrintPlan document only after this
+ * interval elapses, so repeated polls of a long-running query do not resend
+ * the (unchanging) plan on every signal.
+ */
+#define PLAN_DOC_RESEND_INTERVAL_MS (2 * 60 * 1000)
+
+/*
  * Status codes returned by the signal handler to describe the state of the
  * queried backend.
  */
@@ -187,6 +195,7 @@ typedef enum
 extern bool           pg_qs_enable;
 extern bool           pg_qs_timing;
 extern bool           pg_qs_buffers;
+extern bool           pg_qs_emit_on_finish;
 extern List          *QueryDescStack;
 extern pg_qs_params  *params;
 extern shm_mq        *mq;
@@ -241,6 +250,14 @@ extern void qs_get_node_stats(PlanState *, QsWalkerContext *);
 /* Debug logging helpers -- emit collected stats to PostgreSQL LOG. */
 extern void qs_debug_node_stats(List *per_node_stats);
 extern void qs_debug_node_sample(GpscNodeSample *sample);
+
+/*
+ * emit_node_batch -- flatten a List<GpscNodeSample *> into an array and push
+ * it to the yagpcc UDS sink as a single SetPerNodeBatchReq (one connection
+ * per backend).  No-op on an empty list.  The caller must have invoked
+ * gpsc_qs_sync_config() first.
+ */
+extern void emit_node_batch(List *per_node_stats);
 
 /* Query filtering and miscellaneous helpers. */
 extern bool filter_query(QueryDesc *queryDesc);
