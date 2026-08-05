@@ -290,9 +290,9 @@ qs_get_node_stats(PlanState *planstate, QsWalkerContext *qs_walker_ctx)
 		(GpscNodeSample *) palloc0(sizeof(GpscNodeSample));
 
 	/* Identity fields. */
-	gp_gettmid(&nodestat->tmid);
-	nodestat->ssid    = gp_session_id;
-	nodestat->ccnt    = gp_command_count;
+	nodestat->tmid = params->tmid;
+	nodestat->ssid = gp_session_id;
+	nodestat->ccnt = params->ccnt;
 
 	/* Plan-tree position. */
 	nodestat->plan_node_id        = planstate->plan->plan_node_id;
@@ -620,14 +620,17 @@ SendQueryState(void)
 		 */
 		if (Gp_role == GP_ROLE_DISPATCH)
 		{
-			int32_t	tmid;
 			bool	is_same_query;
 			bool	is_stale;
 
-			gp_gettmid(&tmid);
-			is_same_query = (tmid == last_sent_query_key.tmid &&
+			/*
+			 * Use the request's (tmid, ccnt) from params, the same key the
+			 * per-node stats are stamped with, so the plan-doc and the nodes
+			 * land under one query key that matches the catalog.
+			 */
+			is_same_query = (params->tmid == last_sent_query_key.tmid &&
 							 gp_session_id == last_sent_query_key.ssid &&
-							 gp_command_count == last_sent_query_key.ccnt);
+							 params->ccnt == last_sent_query_key.ccnt);
 			is_stale = !is_same_query ||
 				TimestampDifferenceExceeds(last_sent_query_key.at,
 										   GetCurrentTimestamp(),
@@ -638,12 +641,12 @@ SendQueryState(void)
 				char *plan_doc = build_plan_doc(get_toppest_query(),
 												EXPLAIN_FORMAT_JSON);
 
-				gpsc_emit_query_plan(tmid, gp_session_id, gp_command_count,
+				gpsc_emit_query_plan(params->tmid, gp_session_id, params->ccnt,
 									 plan_doc, EXPLAIN_FORMAT_JSON);
 
-				last_sent_query_key.tmid = tmid;
+				last_sent_query_key.tmid = params->tmid;
 				last_sent_query_key.ssid = gp_session_id;
-				last_sent_query_key.ccnt = gp_command_count;
+				last_sent_query_key.ccnt = params->ccnt;
 				last_sent_query_key.at   = GetCurrentTimestamp();
 			}
 		}
@@ -782,6 +785,21 @@ SendCdbComponents(void)
 			msg->reqid       = *mq_req_id;
 			msg->length      = msglen;
 			msg->result_code = QS_RETURNED;
+
+			/*
+			 * Report our own query key so the requestor can stamp QE-side
+			 * per-node stats with the same (tmid, ccnt) the catalog uses. This
+			 * is the target backend, so get_toppest_query() is the query being
+			 * inspected; its gpsc_query_key is set by the QueryStat submit hook.
+			 */
+			{
+				QueryDesc *top_query = get_toppest_query();
+				if (top_query && top_query->gpsc_query_key)
+				{
+					msg->tmid = top_query->gpsc_query_key->tmid;
+					msg->ccnt = top_query->gpsc_query_key->ccnt;
+				}
+			}
 
 			for (int i = 0; i < cdbs->total_segment_dbs; i++)
 			{

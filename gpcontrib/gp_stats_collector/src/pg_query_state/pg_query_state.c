@@ -158,8 +158,9 @@ static List *get_query_backend_info(ArrayType *array);
 static shm_mq_result receive_msg_by_parts(shm_mq_handle *mqh, Size *total,
 										  void **datap, int64 timeout,
 										  int *rc, bool nowait);
-static PG_QS_RequestResult GetRemoteBackendInfo(PGPROC *proc, List **result);
-static void CollectQEQueryState(List *backendInfo);
+static PG_QS_RequestResult GetRemoteBackendInfo(PGPROC *proc, List **result,
+												int32 *out_tmid, int32 *out_ccnt);
+static void CollectQEQueryState(List *backendInfo, int32 tmid, int32 ccnt);
 
 #if PG_VERSION_NUM >= 150000
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
@@ -588,7 +589,8 @@ UnlockShmem(LOCKTAG *tag)
  * Returns the PG_QS_RequestResult code from the reply.
  */
 static PG_QS_RequestResult
-GetRemoteBackendInfo(PGPROC *proc, List **result)
+
+GetRemoteBackendInfo(PGPROC *proc, List **result, int32 *out_tmid, int32 *out_ccnt)
 {
 	int sig_result;
 	shm_mq_handle *mqh;
@@ -633,6 +635,16 @@ GetRemoteBackendInfo(PGPROC *proc, List **result)
 		return result_code;
 	}
 
+	/*
+	 * The target reports its own query key (tmid, ccnt) so the caller can stamp
+	 * QE-side per-node stats with the same key the catalog uses, rather than the
+	 * caller's own (SELECT pg_query_state()) command count.
+	 */
+	if (out_tmid)
+		*out_tmid = msg->tmid;
+	if (out_ccnt)
+		*out_ccnt = msg->ccnt;
+
 	{
 		int expected_len = BASE_SIZEOF_GP_BACKEND_INFO +
 						   msg->number * sizeof(gp_segment_pid);
@@ -662,7 +674,7 @@ GetRemoteBackendInfo(PGPROC *proc, List **result)
  * backendInfo.  Results are returned as raw CdbPgResults.
  */
 static void
-CollectQEQueryState(List *backendInfo)
+CollectQEQueryState(List *backendInfo, int32 tmid, int32 ccnt)
 {
 	ListCell       *lc;
 	int             index = 0;
@@ -683,8 +695,15 @@ CollectQEQueryState(List *backendInfo)
 			appendStringInfoChar(&params_buf, ',');
 	}
 
-	sql = psprintf("SELECT gpsc.cbdb_mpp_query_state((ARRAY[%s])::gpsc.gp_segment_pid[])",
-				   params_buf.data);
+	/*
+	 * tmid/ccnt are the TARGET backend's query key (reported via
+	 * GetRemoteBackendInfo), NOT this backend's: we run SELECT
+	 * gpsc.pg_query_state(), whose command count differs from the inspected
+	 * query. Passing them to the QEs makes their per-node stats carry the same
+	 * (tmid, ccnt) the catalog uses, so exact-key lookups match.
+	 */
+	sql = psprintf("SELECT gpsc.cbdb_mpp_query_state((ARRAY[%s])::gpsc.gp_segment_pid[], %d, %d)",
+				   params_buf.data, tmid, ccnt);
 
 	CdbDispatchCommand(sql, DF_NONE, NULL);
 	pfree(params_buf.data);
@@ -826,6 +845,8 @@ pg_query_state(PG_FUNCTION_ARGS)
 	PG_QS_RequestResult  result;
 	List                *backend_info = NIL;
 	Oid					 counterpart_user_id;
+	int32				 target_tmid = 0;
+	int32				 target_ccnt = 0;
 
 	if (pid == MyProcPid)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -851,7 +872,7 @@ pg_query_state(PG_FUNCTION_ARGS)
 
 	LockShmem(&tag, PG_QS_RCV_KEY);
 	reqid = *mq_req_id + 1;
-	result = GetRemoteBackendInfo(proc, &backend_info);
+	result = GetRemoteBackendInfo(proc, &backend_info, &target_tmid, &target_ccnt);
 	UnlockShmem(&tag);
 
 	switch (result)
@@ -865,14 +886,30 @@ pg_query_state(PG_FUNCTION_ARGS)
 			break;
 
 		case QS_RETURNED:
-			/* Signal all segment QEs to push their plan-node stats via UDS. */
-			CollectQEQueryState(backend_info);
+			/*
+			 * Signal all segment QEs to push their plan-node stats via UDS,
+			 * carrying the target's (tmid, ccnt) so QE-side stats are stamped
+			 * with the same key the catalog uses (the QE's local
+			 * gp_command_count can diverge from the QD on a fresh gang).
+			 */
+			CollectQEQueryState(backend_info, target_tmid, target_ccnt);
 
 			/*
 			 * Signal the QD backend itself so it pushes coordinator-side plan
 			 * nodes and the plan-doc.  SendQueryState() emits directly via UDS.
+			 * Stamp the coordinator's params with the target key so the QD and
+			 * QE paths are uniform (qs_get_node_stats reads params->tmid/ccnt).
+			 *
+			 * Hold the send lock across the params write and the signal so
+			 * concurrent pg_query_state() callers on the coordinator cannot
+			 * overwrite params->{tmid,ccnt} between our write and the target
+			 * backend reading them.
 			 */
+			LockShmem(&tag, PG_QS_SND_KEY);
+			params->tmid = target_tmid;
+			params->ccnt = target_ccnt;
 			SendProcSignal(proc->pid, QueryStatePollReason, proc->backendId);
+			UnlockShmem(&tag);
 			break;
 	}
 
@@ -958,7 +995,7 @@ pg_query_state_backends(PG_FUNCTION_ARGS)
 
 	LockShmem(&tag, PG_QS_RCV_KEY);
 	reqid = *mq_req_id + 1;
-	info_result = GetRemoteBackendInfo(proc, &backend_info);
+	info_result = GetRemoteBackendInfo(proc, &backend_info, NULL, NULL);
 	UnlockShmem(&tag);
 
 	/* Not running / disabled: return an empty set rather than erroring. */
@@ -991,7 +1028,7 @@ cbdb_mpp_query_state(PG_FUNCTION_ARGS)
 {
 	ListCell *iter;
 	List     *alive_procs = get_query_backend_info(PG_GETARG_ARRAYTYPE_P(0));
-
+	
 	if (alive_procs == NIL)
 		PG_RETURN_NULL();
 
@@ -1002,6 +1039,8 @@ cbdb_mpp_query_state(PG_FUNCTION_ARGS)
 	params->buffers  = true;
 	params->triggers = false;
 	params->format   = EXPLAIN_FORMAT_JSON;
+	params->tmid 	 = PG_GETARG_INT32(1);
+	params->ccnt 	 = PG_GETARG_INT32(2);
 
 	foreach(iter, alive_procs)
 	{

@@ -129,10 +129,13 @@ RETURNS SETOF void
 AS 'MODULE_PATHNAME', 'pg_query_state'
 LANGUAGE C VOLATILE EXECUTE ON COORDINATOR;
 
--- cbdb_mpp_query_state(gp_segment_pid[]): dispatched verbatim to every segment
--- by pg_query_state() via CdbDispatchCommand; runs locally on each QE, so no
--- EXECUTE ON marker. Signals the matching local backends.
-CREATE FUNCTION gpsc.cbdb_mpp_query_state(gpsc.gp_segment_pid[])
+-- cbdb_mpp_query_state(gp_segment_pid[], tmid, ccnt): dispatched verbatim to
+-- every segment by pg_query_state() via CdbDispatchCommand; runs locally on
+-- each QE, so no EXECUTE ON marker. Signals the matching local backends.  tmid
+-- and ccnt carry the coordinator's query key so QE-side per-node stats are
+-- stamped with the same (tmid, ccnt) the catalog reports, instead of the QE's
+-- local gp_command_count which can differ from the QD on a fresh gang.
+CREATE FUNCTION gpsc.cbdb_mpp_query_state(gpsc.gp_segment_pid[], tmid int, ccnt int)
 RETURNS SETOF void
 AS 'MODULE_PATHNAME', 'cbdb_mpp_query_state'
 LANGUAGE C VOLATILE;
@@ -154,4 +157,4 @@ LANGUAGE C VOLATILE EXECUTE ON COORDINATOR;
 GRANT USAGE ON SCHEMA gpsc TO PUBLIC;
 GRANT EXECUTE ON FUNCTION gpsc.pg_query_state(int) TO PUBLIC;
 GRANT EXECUTE ON FUNCTION gpsc.pg_query_state_backends(int) TO PUBLIC;
-GRANT EXECUTE ON FUNCTION gpsc.cbdb_mpp_query_state(gpsc.gp_segment_pid[]) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION gpsc.cbdb_mpp_query_state(gpsc.gp_segment_pid[], int, int) TO PUBLIC;

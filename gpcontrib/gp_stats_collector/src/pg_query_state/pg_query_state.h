@@ -150,6 +150,14 @@ typedef struct
 	int length;
 	PGPROC *proc;
 	PG_QS_RequestResult result_code;
+	/*
+	 * The target backend's own query key (from its gpsc_query_key), reported
+	 * back so the requestor can stamp QE-side per-node stats with the same
+	 * (tmid, ccnt) the QueryStat catalog uses.  The requestor runs a different
+	 * query (SELECT pg_query_state()), so it cannot derive these itself.
+	 */
+	int32 tmid;
+	int32 ccnt;
 	int number;
 	gp_segment_pid pids[FLEXIBLE_ARRAY_MEMBER];
 } backend_info;
@@ -170,6 +178,8 @@ typedef struct
 	bool    buffers;
 	bool    triggers;
 	ExplainFormat format;
+	int32_t tmid;
+	int32_t ccnt;
 } pg_qs_params;
 
 /*
@@ -178,9 +188,9 @@ typedef struct
  */
 typedef struct QsWalkerContext
 {
-	List   *per_node_stats;
-	int32   parent_plan_node_id;
-	bool 	finalize; /* true only in pg_qs_executor end */
+	List    *per_node_stats;
+	int32_t  parent_plan_node_id;
+	bool 	 finalize; /* true only in pg_qs_executor end */
 } QsWalkerContext;
 
 /*
