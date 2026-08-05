@@ -187,4 +187,5 @@ echo """
 # Finally, the script starts an interactive bash shell to keep the
 # container running and allow the user to interact with the environment.
 # ----------------------------------------------------------------------
-/bin/bash
+# /bin/bash
+

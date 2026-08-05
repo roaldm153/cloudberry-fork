@@ -131,10 +131,16 @@ fi
 if [[ "${CODEBASE_VERSION}" = "main" || "${CODEBASE_VERSION}" = "local" ]]; then
     DOCKERFILE="${SANDBOX_DIR}/Dockerfile.main.${OS_VERSION}"
 
+    # Local yagpcc working tree, passed as a named build context so the
+    # yagpcc-builder stage compiles our changes instead of cloning a remote
+    # branch. Override with YAGPCC_LOCAL_DIR if yagpcc lives elsewhere.
+    YAGPCC_LOCAL_DIR="${YAGPCC_LOCAL_DIR:-$(cd "${REPO_ROOT}/../yagpcc" && pwd)}"
+
     # Single image build from main or local source
     docker build --file ${DOCKERFILE} \
                  --build-arg TIMEZONE_VAR="${TIMEZONE_VAR}" \
                  --build-arg CODEBASE_VERSION="${CODEBASE_VERSION}" \
+                 --build-context yagpcc-local="${YAGPCC_LOCAL_DIR}" \
                  --tag cbdb-${CODEBASE_VERSION}:${OS_VERSION} \
                  ${REPO_ROOT}
 else

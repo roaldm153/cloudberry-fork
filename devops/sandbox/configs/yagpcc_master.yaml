@@ -1,0 +1,17 @@
+role: master
+listen_port: 1432
+segment_pull_rate_sec: 3
+segment_pull_threads: 2
+csv_port: 1440
+ping_port: 1435
+ui_port: 1441   # раскомментируйте, если собрали make build-all
+master_connection:
+  addrs:
+    - cdw:5432
+  user: gpadmin
+  dbname: postgres
+  sslmode: disable
+  password: ""      # в sandbox используется trust-аутентификация для gpadmin
+app:
+  logging:
+    level: debug

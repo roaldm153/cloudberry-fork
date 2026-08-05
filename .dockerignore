@@ -1,0 +1,33 @@
+# Keep build artifacts out of the Docker build context.  run.sh -c local sends
+# the whole repo as the context; without this, object files from a host/dev
+# build (e.g. a devcontainer `make install`) get copied into the image and the
+# in-image `make` reuses those stale .o -- which were compiled against the dev
+# environment's Xerces/GSS headers -- causing link errors (undefined
+# xercesc_3_2::*, pqsecure_open_gss).  Force a clean in-image build instead.
+**/*.o
+**/*.a
+**/*.so
+**/*.so.*
+**/*.lo
+**/*.la
+**/*.bc
+
+# Build markers/deps that make a stale tree look already-built (which makes the
+# in-image `make` skip compilation and then fail to link the missing .o files).
+**/objfiles.txt
+**/.deps/
+src/protos/
+
+# configure output -- regenerated in the image by configure-cloudberry.sh.
+config.log
+config.status
+build-logs/
+
+# Local tooling / editor state -- not needed to build.
+.git
+.devcontainer/
+compile_commands.json
+.cache/
+
+# Local scratch not needed in the image.
+test_queries/

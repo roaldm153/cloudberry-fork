@@ -24,6 +24,8 @@ services:
     image: cbdb-${CODEBASE_VERSION}:${OS_VERSION}
     ports:
     - "15432:5432"
+    - "1432:1432"
+    - "1441:1441"
     hostname: cdw
     tty: true
     networks:
