@@ -14,18 +14,17 @@ CREATE TYPE gpsc.gp_segment_pid AS (
 -- running on backend `pid`.  Fans QueryStatePollReason out to every QE via
 -- cbdb_mpp_query_state; each matching QE walks its plan tree and pushes a
 -- per-node batch to its local yagpcc over UDS.  Fire-and-forget: returns void.
-CREATE FUNCTION gpsc.pg_query_state(pid int)
+CREATE FUNCTION gpsc.pg_query_state(pid int, trace_id bytea)
 RETURNS SETOF void
 AS 'MODULE_PATHNAME', 'pg_query_state'
 LANGUAGE C VOLATILE EXECUTE ON COORDINATOR;
 
--- cbdb_mpp_query_state(gp_segment_pid[], tmid, ccnt): dispatched verbatim to
+-- cbdb_mpp_query_state(gp_segment_pid[], trace_id): dispatched verbatim to
 -- every segment by pg_query_state() via CdbDispatchCommand; runs locally on
--- each QE, so no EXECUTE ON marker. Signals the matching local backends.  tmid
--- and ccnt carry the coordinator's query key so QE-side per-node stats are
--- stamped with the same (tmid, ccnt) the catalog reports, instead of the QE's
--- local gp_command_count which can differ from the QD on a fresh gang.
-CREATE FUNCTION gpsc.cbdb_mpp_query_state(gpsc.gp_segment_pid[], tmid int, ccnt int)
+-- each QE, so no EXECUTE ON marker. Signals the matching local backends.  The
+-- trace_id is stamped into every per-node batch so all backends' pushes land
+-- under the one key this collection owns.
+CREATE FUNCTION gpsc.cbdb_mpp_query_state(gpsc.gp_segment_pid[], trace_id bytea)
 RETURNS SETOF void
 AS 'MODULE_PATHNAME', 'cbdb_mpp_query_state'
 LANGUAGE C VOLATILE;
@@ -45,6 +44,6 @@ LANGUAGE C VOLATILE EXECUTE ON COORDINATOR;
 -- under a non-superuser role.  cbdb_mpp_query_state is dispatched to the QEs
 -- under the caller's role, so it needs EXECUTE too.
 GRANT USAGE ON SCHEMA gpsc TO PUBLIC;
-GRANT EXECUTE ON FUNCTION gpsc.pg_query_state(int) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION gpsc.pg_query_state(int, bytea) TO PUBLIC;
 GRANT EXECUTE ON FUNCTION gpsc.pg_query_state_backends(int) TO PUBLIC;
-GRANT EXECUTE ON FUNCTION gpsc.cbdb_mpp_query_state(gpsc.gp_segment_pid[], int, int) TO PUBLIC;
+GRANT EXECUTE ON FUNCTION gpsc.cbdb_mpp_query_state(gpsc.gp_segment_pid[], bytea) TO PUBLIC;
