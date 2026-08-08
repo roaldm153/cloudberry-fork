@@ -74,6 +74,7 @@
 #include "storage/procarray.h"
 #include "storage/procsignal.h"
 #include "storage/shm_toc.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/timestamp.h"
 #include "utils/lsyscache.h"
@@ -141,6 +142,13 @@ shm_mq *mq = NULL;
  */
 uint32 *mq_req_id = NULL;
 
+/*
+ * Per-backend trace_id slots (slot 3 in the toc), indexed by BackendId.  See
+ * the header: each signaled backend reads its own slot so concurrent
+ * collections never clobber each other's trace.
+ */
+char (*qs_trace_slots)[GPSC_TRACE_ID_LEN] = NULL;
+
 /* Global signal-reason handles (set during pg_qs_init) */
 List *QueryDescStack = NIL;
 
@@ -158,9 +166,8 @@ static List *get_query_backend_info(ArrayType *array);
 static shm_mq_result receive_msg_by_parts(shm_mq_handle *mqh, Size *total,
 										  void **datap, int64 timeout,
 										  int *rc, bool nowait);
-static PG_QS_RequestResult GetRemoteBackendInfo(PGPROC *proc, List **result,
-												int32 *out_tmid, int32 *out_ccnt);
-static void CollectQEQueryState(List *backendInfo, int32 tmid, int32 ccnt);
+static PG_QS_RequestResult GetRemoteBackendInfo(PGPROC *proc, List **result);
+static void CollectQEQueryState(List *backendInfo, bytea *trace_id);
 
 #if PG_VERSION_NUM >= 150000
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
@@ -170,22 +177,24 @@ static void pg_qs_shmem_request(void);
 /*
  * pg_qs_shmem_size -- compute the size of the shared memory segment.
  *
- * The segment holds three objects at fixed toc keys:
+ * The segment holds four objects at fixed toc keys:
  *   key 0: pg_qs_params
  *   key 1: message queue of QUEUE_SIZE bytes
  *   key 2: uint32 request-id counter
+ *   key 3: per-backend trace_id slots, char[GPSC_TRACE_ID_LEN] × (MaxBackends+1)
  */
 static Size
 pg_qs_shmem_size(void)
 {
 	shm_toc_estimator e;
 	Size size;
-	int  nkeys = 3;
+	int  nkeys = 4;
 
 	shm_toc_initialize_estimator(&e);
 	shm_toc_estimate_chunk(&e, sizeof(pg_qs_params));
 	shm_toc_estimate_chunk(&e, (Size) QUEUE_SIZE);
 	shm_toc_estimate_chunk(&e, sizeof(uint32));
+	shm_toc_estimate_chunk(&e, (Size) GPSC_TRACE_ID_LEN * (MaxBackends + 1));
 	shm_toc_estimate_keys(&e, nkeys);
 	size = shm_toc_estimate(&e);
 	return size;
@@ -221,13 +230,19 @@ pg_qs_shmem_startup(void)
 		mq_req_id = shm_toc_allocate(toc, sizeof(uint32));
 		shm_toc_insert(toc, num_toc++, mq_req_id);
 		*mq_req_id = 0;
+
+		qs_trace_slots = shm_toc_allocate(toc,
+										  (Size) GPSC_TRACE_ID_LEN * (MaxBackends + 1));
+		shm_toc_insert(toc, num_toc++, qs_trace_slots);
+		memset(qs_trace_slots, 0, (Size) GPSC_TRACE_ID_LEN * (MaxBackends + 1));
 	}
 	else
 	{
 		toc = shm_toc_attach(PG_QS_MODULE_KEY, shmem);
-		params    = shm_toc_lookup(toc, num_toc++, false);
-		mq        = shm_toc_lookup(toc, num_toc++, false);
-		mq_req_id = shm_toc_lookup(toc, num_toc++, false);
+		params         = shm_toc_lookup(toc, num_toc++, false);
+		mq             = shm_toc_lookup(toc, num_toc++, false);
+		mq_req_id      = shm_toc_lookup(toc, num_toc++, false);
+		qs_trace_slots = shm_toc_lookup(toc, num_toc++, false);
 	}
 	LWLockRelease(AddinShmemInitLock);
 
@@ -378,6 +393,8 @@ pg_qs_executor_start(QueryDesc *queryDesc, int eflags)
 			queryDesc->showstatctx =
 				cdbexplain_showExecStatsBegin(queryDesc, starttime);
 		queryDesc->totaltime = InstrAlloc(1, INSTRUMENT_ALL, false);
+
+		gpsc_reset_node_roll_state();
 	}
 
 	if (queryDesc->plannedstmt->queryId == 0)
@@ -411,11 +428,10 @@ pg_qs_executor_finish(QueryDesc *queryDesc)
 /*
  * pg_qs_executor_end -- called when executor resources are released.
  *
- * Walks the plan tree with instrumentation finalized (InstrEndLoop) and writes
- * the collected per-node stats to the server log.  When pg_qs_emit_on_finish
- * is true, also pushes the stats to the yagpcc UDS sink via
- * gpsc_emit_plan_batch(); the walker has already run with finalize=true, so
- * every node reports as FINISHED.
+ * Walks the plan tree with instrumentation finalized (InstrEndLoop), writes the
+ * collected per-node stats to the server log, and resets the per-node rolling
+ * state for the next query.  It does NOT push to the yagpcc UDS sink: a finish
+ * is not a collection and has no trace_id to key under (see body).
  */
 void
 pg_qs_executor_end(QueryDesc *queryDesc)
@@ -427,15 +443,19 @@ pg_qs_executor_end(QueryDesc *queryDesc)
 
 	qs_walker_ctx = (QsWalkerContext *) palloc0(sizeof(QsWalkerContext));
 	qs_walker_ctx->finalize = true;
+	qs_walker_ctx->ts_now = GetCurrentTimestamp();
 	qs_planstate_walker(queryDesc->planstate, qs_get_node_stats,
 						qs_walker_ctx, 0);
 	qs_debug_node_stats(qs_walker_ctx->per_node_stats);
 
-	if (pg_qs_emit_on_finish)
-	{
-		gpsc_qs_sync_config();
-		emit_node_batch(qs_walker_ctx->per_node_stats);
-	}
+	/*
+	 * Do NOT push to the yagpcc UDS sink here: a finishing query is not part of
+	 * any collection, so there is no trace_id to key it under — an unsolicited
+	 * push would land under a stale/other collection's trace and contaminate a
+	 * live graph.  The poll path already observes FINISHED nodes via the signal.
+	 */
+
+	gpsc_reset_node_roll_state();
 }
 
 /*
@@ -590,7 +610,7 @@ UnlockShmem(LOCKTAG *tag)
  */
 static PG_QS_RequestResult
 
-GetRemoteBackendInfo(PGPROC *proc, List **result, int32 *out_tmid, int32 *out_ccnt)
+GetRemoteBackendInfo(PGPROC *proc, List **result)
 {
 	int sig_result;
 	shm_mq_handle *mqh;
@@ -635,16 +655,7 @@ GetRemoteBackendInfo(PGPROC *proc, List **result, int32 *out_tmid, int32 *out_cc
 		return result_code;
 	}
 
-	/*
-	 * The target reports its own query key (tmid, ccnt) so the caller can stamp
-	 * QE-side per-node stats with the same key the catalog uses, rather than the
-	 * caller's own (SELECT pg_query_state()) command count.
-	 */
-	if (out_tmid)
-		*out_tmid = msg->tmid;
-	if (out_ccnt)
-		*out_ccnt = msg->ccnt;
-
+	/* Validate the reply payload length against the reported backend count. */
 	{
 		int expected_len = BASE_SIZEOF_GP_BACKEND_INFO +
 						   msg->number * sizeof(gp_segment_pid);
@@ -674,12 +685,13 @@ GetRemoteBackendInfo(PGPROC *proc, List **result, int32 *out_tmid, int32 *out_cc
  * backendInfo.  Results are returned as raw CdbPgResults.
  */
 static void
-CollectQEQueryState(List *backendInfo, int32 tmid, int32 ccnt)
+CollectQEQueryState(List *backendInfo, bytea *trace_id)
 {
 	ListCell       *lc;
 	int             index = 0;
 	StringInfoData  params_buf;
 	char           *sql;
+	char			trace_id_hex[33];
 
 	if (list_length(backendInfo) == 0)
 		return;
@@ -695,15 +707,10 @@ CollectQEQueryState(List *backendInfo, int32 tmid, int32 ccnt)
 			appendStringInfoChar(&params_buf, ',');
 	}
 
-	/*
-	 * tmid/ccnt are the TARGET backend's query key (reported via
-	 * GetRemoteBackendInfo), NOT this backend's: we run SELECT
-	 * gpsc.pg_query_state(), whose command count differs from the inspected
-	 * query. Passing them to the QEs makes their per-node stats carry the same
-	 * (tmid, ccnt) the catalog uses, so exact-key lookups match.
-	 */
-	sql = psprintf("SELECT gpsc.cbdb_mpp_query_state((ARRAY[%s])::gpsc.gp_segment_pid[], %d, %d)",
-				   params_buf.data, tmid, ccnt);
+	hex_encode(VARDATA_ANY(trace_id), 16, trace_id_hex);
+	trace_id_hex[32] = '\0';
+	sql = psprintf("SELECT gpsc.cbdb_mpp_query_state((ARRAY[%s])::gpsc.gp_segment_pid[], '\\x%s'::bytea)",
+				   params_buf.data, trace_id_hex);
 
 	CdbDispatchCommand(sql, DF_NONE, NULL);
 	pfree(params_buf.data);
@@ -840,22 +847,30 @@ Datum
 pg_query_state(PG_FUNCTION_ARGS)
 {
 	pid_t                pid = PG_GETARG_INT32(0);
+	bytea 				*trace_id = PG_GETARG_BYTEA_P(1);
 	PGPROC              *proc;
 	LOCKTAG              tag;
 	PG_QS_RequestResult  result;
 	List                *backend_info = NIL;
 	Oid					 counterpart_user_id;
-	int32				 target_tmid = 0;
-	int32				 target_ccnt = 0;
+
+	if (VARSIZE_ANY_EXHDR(trace_id) != 16)
+	{
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), 
+			errmsg("invalid size of trace_id: %lu, expected 16", VARSIZE_ANY_EXHDR(trace_id))));
+	}
 
 	if (pid == MyProcPid)
+	{
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("cannot extract state of current process")));
+	}
 
 	if (!module_initialized)
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+	{
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("pg_query_state must be loaded via shared_preload_libraries")));
+	}
 
 	proc = BackendPidGetProc(pid);
 	if (!proc || proc->backendId == InvalidBackendId ||
@@ -872,7 +887,7 @@ pg_query_state(PG_FUNCTION_ARGS)
 
 	LockShmem(&tag, PG_QS_RCV_KEY);
 	reqid = *mq_req_id + 1;
-	result = GetRemoteBackendInfo(proc, &backend_info, &target_tmid, &target_ccnt);
+	result = GetRemoteBackendInfo(proc, &backend_info);
 	UnlockShmem(&tag);
 
 	switch (result)
@@ -888,28 +903,20 @@ pg_query_state(PG_FUNCTION_ARGS)
 		case QS_RETURNED:
 			/*
 			 * Signal all segment QEs to push their plan-node stats via UDS,
-			 * carrying the target's (tmid, ccnt) so QE-side stats are stamped
-			 * with the same key the catalog uses (the QE's local
-			 * gp_command_count can diverge from the QD on a fresh gang).
+			 * carrying the trace_id so every backend's batch lands under the one
+			 * key this pg_query_state() invocation owns.
 			 */
-			CollectQEQueryState(backend_info, target_tmid, target_ccnt);
+			CollectQEQueryState(backend_info, trace_id);
 
 			/*
 			 * Signal the QD backend itself so it pushes coordinator-side plan
 			 * nodes and the plan-doc.  SendQueryState() emits directly via UDS.
-			 * Stamp the coordinator's params with the target key so the QD and
-			 * QE paths are uniform (qs_get_node_stats reads params->tmid/ccnt).
-			 *
-			 * Hold the send lock across the params write and the signal so
-			 * concurrent pg_query_state() callers on the coordinator cannot
-			 * overwrite params->{tmid,ccnt} between our write and the target
-			 * backend reading them.
+			 * Stamp the target's own trace slot before signalling, so its batch
+			 * lands under this collection's key with no shared-slot race.
 			 */
-			LockShmem(&tag, PG_QS_SND_KEY);
-			params->tmid = target_tmid;
-			params->ccnt = target_ccnt;
+			memcpy(qs_trace_slots[proc->backendId], VARDATA_ANY(trace_id),
+				   GPSC_TRACE_ID_LEN);
 			SendProcSignal(proc->pid, QueryStatePollReason, proc->backendId);
-			UnlockShmem(&tag);
 			break;
 	}
 
@@ -978,6 +985,13 @@ pg_query_state_backends(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("backend with pid=%d not found", pid)));
 
+	if (!module_initialized)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pg_query_state must be loaded via shared_preload_libraries")));
+	}
+
 	counterpart_user_id = proc->roleId;
 	if (!(superuser() || GetUserId() == counterpart_user_id))
 	{
@@ -985,22 +999,14 @@ pg_query_state_backends(PG_FUNCTION_ARGS)
 						errmsg("permission denied")));
 	}
 
-	if (!module_initialized)
-	{
-		UnlockShmem(&tag);
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("pg_query_state must be loaded via shared_preload_libraries")));
-	}
-
 	LockShmem(&tag, PG_QS_RCV_KEY);
 	reqid = *mq_req_id + 1;
-	info_result = GetRemoteBackendInfo(proc, &backend_info, NULL, NULL);
+	info_result = GetRemoteBackendInfo(proc, &backend_info);
 	UnlockShmem(&tag);
 
 	/* Not running / disabled: return an empty set rather than erroring. */
 	if (info_result != QS_RETURNED)
-		return (Datum) 0;
+		return (Datum) NULL;
 
 	foreach(lc, backend_info)
 	{
@@ -1013,7 +1019,7 @@ pg_query_state_backends(PG_FUNCTION_ARGS)
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}
 
-	return (Datum) 0;
+	return (Datum) NULL;
 }
 
 /*
@@ -1028,6 +1034,13 @@ cbdb_mpp_query_state(PG_FUNCTION_ARGS)
 {
 	ListCell *iter;
 	List     *alive_procs = get_query_backend_info(PG_GETARG_ARRAYTYPE_P(0));
+	bytea 	 *trace_id = PG_GETARG_BYTEA_P(1);
+
+	if (VARSIZE_ANY_EXHDR(trace_id) != 16)
+	{
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), 
+			errmsg("invalid size of trace_id: %lu, expected 16", VARSIZE_ANY_EXHDR(trace_id))));
+	}
 	
 	if (alive_procs == NIL)
 		PG_RETURN_NULL();
@@ -1039,8 +1052,6 @@ cbdb_mpp_query_state(PG_FUNCTION_ARGS)
 	params->buffers  = true;
 	params->triggers = false;
 	params->format   = EXPLAIN_FORMAT_JSON;
-	params->tmid 	 = PG_GETARG_INT32(1);
-	params->ccnt 	 = PG_GETARG_INT32(2);
 
 	foreach(iter, alive_procs)
 	{
@@ -1049,6 +1060,10 @@ cbdb_mpp_query_state(PG_FUNCTION_ARGS)
 
 		if (!proc)
 			continue;
+
+		/* Stamp the target's own trace slot before signalling it. */
+		memcpy(qs_trace_slots[proc->backendId], VARDATA_ANY(trace_id),
+			   GPSC_TRACE_ID_LEN);
 
 		sig_result = SendProcSignal(proc->pid, QueryStatePollReason,
 									proc->backendId);

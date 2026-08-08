@@ -73,6 +73,7 @@
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/timestamp.h"
+#include "utils/hsearch.h"
 #include "libpq/pqmq.h"
 
 /*
@@ -87,6 +88,42 @@ static struct
 	int32_t		ccnt;
 	TimestampTz at;
 } last_sent_query_key;
+
+typedef struct NodeRollState
+{
+	int32_t plan_node_id;
+	double prev_ntuples_sum;
+	TimestampTz prev_executed_at;
+	TimestampTz first_executed_at;
+} NodeRollState;
+
+static HTAB *node_roll_htab = NULL;
+
+static void ensure_node_roll_htab(void)
+{
+	HASHCTL ctl;
+
+	if (node_roll_htab)
+	{
+		return;
+	}
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(int);
+	ctl.entrysize = sizeof(NodeRollState);
+	ctl.hcxt = TopMemoryContext;
+	node_roll_htab = hash_create("gpsc_per_node_roll_state", 
+		64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+void gpsc_reset_node_roll_state(void)
+{
+	if (node_roll_htab)
+	{
+		hash_destroy(node_roll_htab);
+		node_roll_htab = NULL;
+	}
+}
 
 /*
  * shm_mq_send_nonblocking -- attempt to send nbytes through mqh up to
@@ -290,9 +327,9 @@ qs_get_node_stats(PlanState *planstate, QsWalkerContext *qs_walker_ctx)
 		(GpscNodeSample *) palloc0(sizeof(GpscNodeSample));
 
 	/* Identity fields. */
-	nodestat->tmid = params->tmid;
 	nodestat->ssid = gp_session_id;
-	nodestat->ccnt = params->ccnt;
+	gp_gettmid(&nodestat->tmid);
+	nodestat->ccnt = gp_command_count;
 
 	/* Plan-tree position. */
 	nodestat->plan_node_id        = planstate->plan->plan_node_id;
@@ -301,6 +338,7 @@ qs_get_node_stats(PlanState *planstate, QsWalkerContext *qs_walker_ctx)
 	nodestat->slice_id            = currentSliceId;
 	nodestat->segindex            = GpIdentity.segindex;
 	nodestat->dbid                = GpIdentity.dbid;
+	nodestat->pid 				  = MyProcPid;
 
 	/* Planner estimate. */
 	nodestat->plan_rows = planstate->plan->plan_rows;
@@ -411,6 +449,41 @@ qs_get_node_stats(PlanState *planstate, QsWalkerContext *qs_walker_ctx)
 
 	qs_walker_ctx->per_node_stats =
 		lappend(qs_walker_ctx->per_node_stats, nodestat);
+
+	{
+		TimestampTz ts_now = qs_walker_ctx->ts_now;
+		double cur_sum = nodestat->ntuples;
+		bool found;
+		NodeRollState *rs;
+
+		if (!node_roll_htab)
+		{
+			ensure_node_roll_htab();
+		}
+
+		rs = (NodeRollState *) hash_search(node_roll_htab,
+			&nodestat->plan_node_id, HASH_ENTER, &found);
+		
+		if (found)
+		{
+			double dt = (double) (ts_now - rs->prev_executed_at) / USECS_PER_SEC;
+			nodestat->ntuples_delta = cur_sum - rs->prev_ntuples_sum;
+			nodestat->tuples_per_sec = (dt > 0) ? nodestat->ntuples_delta / dt : 0;
+			nodestat->time_since_init_sec = (double) (ts_now - rs->first_executed_at) / USECS_PER_SEC;
+		}
+		else
+		{
+			nodestat->ntuples_delta = cur_sum;
+			nodestat->tuples_per_sec = 0;
+			nodestat->time_since_init_sec = 0;
+			rs->first_executed_at = ts_now;
+		}
+		nodestat->stalled = (nodestat->ntuples_delta == 0 
+				&& nodestat->node_status == QS_NODE_STATUS_EXECUTING 
+				&& !nodestat->eof);
+		rs->prev_ntuples_sum = cur_sum;
+		rs->prev_executed_at = ts_now;
+	}
 }
 
 /*
@@ -482,6 +555,7 @@ runtime_explain(void)
 
 	Assert(list_length(QueryDescStack) > 0);
 	queryDesc = get_toppest_query();
+	qs_walker_ctx->ts_now = GetCurrentTimestamp();
 	qs_planstate_walker(queryDesc->planstate, qs_get_node_stats,
 						qs_walker_ctx, 0);
 	return qs_walker_ctx->per_node_stats;
@@ -497,7 +571,7 @@ runtime_explain(void)
  * The caller is responsible for calling gpsc_qs_sync_config() beforehand.
  */
 void
-emit_node_batch(List *per_node_stats)
+emit_node_batch(List *per_node_stats, const char *trace_id)
 {
 	GpscNodeSample **arr;
 	ListCell        *lc;
@@ -511,7 +585,7 @@ emit_node_batch(List *per_node_stats)
 	foreach(lc, per_node_stats)
 		arr[i++] = (GpscNodeSample *) lfirst(lc);
 
-	gpsc_emit_plan_batch(arr, n);
+	gpsc_emit_node_batch(arr, n, trace_id);
 }
 
 /*
@@ -605,9 +679,12 @@ SendQueryState(void)
 
 		/*
 		 * Emit the whole plan-tree snapshot as a single batch: one UDS
-		 * connection per backend instead of connect+send+close per node.
+		 * connection per backend instead of connect+send+close per node.  Read
+		 * THIS backend's own trace slot (stamped by the dispatcher before the
+		 * signal) — never a shared slot, so a concurrent collection cannot
+		 * clobber the key this batch lands under.
 		 */
-		emit_node_batch(qs_result);
+		emit_node_batch(qs_result, qs_trace_slots[MyBackendId]);
 
 		/*
 		 * Coordinator-only: push the full ExplainPrintPlan document so yagpcc
@@ -622,15 +699,13 @@ SendQueryState(void)
 		{
 			bool	is_same_query;
 			bool	is_stale;
-
-			/*
-			 * Use the request's (tmid, ccnt) from params, the same key the
-			 * per-node stats are stamped with, so the plan-doc and the nodes
-			 * land under one query key that matches the catalog.
-			 */
-			is_same_query = (params->tmid == last_sent_query_key.tmid &&
+			int32_t tmid;
+		
+			gp_gettmid(&tmid);
+			is_same_query = (tmid == last_sent_query_key.tmid &&
 							 gp_session_id == last_sent_query_key.ssid &&
-							 params->ccnt == last_sent_query_key.ccnt);
+							 gp_command_count == last_sent_query_key.ccnt);
+
 			is_stale = !is_same_query ||
 				TimestampDifferenceExceeds(last_sent_query_key.at,
 										   GetCurrentTimestamp(),
@@ -641,12 +716,12 @@ SendQueryState(void)
 				char *plan_doc = build_plan_doc(get_toppest_query(),
 												EXPLAIN_FORMAT_JSON);
 
-				gpsc_emit_query_plan(params->tmid, gp_session_id, params->ccnt,
+				gpsc_emit_query_plan(tmid, gp_session_id, gp_command_count,
 									 plan_doc, EXPLAIN_FORMAT_JSON);
 
-				last_sent_query_key.tmid = params->tmid;
+				last_sent_query_key.tmid = tmid;
 				last_sent_query_key.ssid = gp_session_id;
-				last_sent_query_key.ccnt = params->ccnt;
+				last_sent_query_key.ccnt = gp_command_count;
 				last_sent_query_key.at   = GetCurrentTimestamp();
 			}
 		}
@@ -778,28 +853,29 @@ SendCdbComponents(void)
 		else
 		{
 			cdbs = cdbcomponent_getCdbComponents();
+
+			/*
+			 * Size the buffer by the number of descriptors we will actually
+			 * emit -- the total length of every segment's activelist, which is
+			 * exactly what fill_segpid walks. cdbs->numActiveQEs is NOT that
+			 * count for every plan shape (a coordinator-heavy INSERT ... SELECT
+			 * leaves the activelists and numActiveQEs out of step): sizing by
+			 * numActiveQEs while filling by activelist overran the allocation
+			 * and produced a length the receiver rejected with "unexpected
+			 * message length". Deriving both length and ->number from the same
+			 * walk keeps them consistent and the write in bounds.
+			 */
+			int qecount = 0;
+			for (int i = 0; i < cdbs->total_segment_dbs; i++)
+				qecount += list_length(cdbs->segment_db_info[i].activelist);
+
 			int msglen = BASE_SIZEOF_GP_BACKEND_INFO +
-						 sizeof(gp_segment_pid) * cdbs->numActiveQEs;
+						 sizeof(gp_segment_pid) * qecount;
 			backend_info *msg = (backend_info *) palloc0(msglen);
 
 			msg->reqid       = *mq_req_id;
 			msg->length      = msglen;
 			msg->result_code = QS_RETURNED;
-
-			/*
-			 * Report our own query key so the requestor can stamp QE-side
-			 * per-node stats with the same (tmid, ccnt) the catalog uses. This
-			 * is the target backend, so get_toppest_query() is the query being
-			 * inspected; its gpsc_query_key is set by the QueryStat submit hook.
-			 */
-			{
-				QueryDesc *top_query = get_toppest_query();
-				if (top_query && top_query->gpsc_query_key)
-				{
-					msg->tmid = top_query->gpsc_query_key->tmid;
-					msg->ccnt = top_query->gpsc_query_key->ccnt;
-				}
-			}
 
 			for (int i = 0; i < cdbs->total_segment_dbs; i++)
 			{
@@ -807,7 +883,7 @@ SendCdbComponents(void)
 					&cdbs->segment_db_info[i];
 				fill_segpid(segInfo, msg, &index);
 			}
-			Assert(index == cdbs->numActiveQEs);
+			Assert(index == qecount);
 			msg->number = index;
 
 			send_result = send_msg_by_parts(mqh, msglen, msg);

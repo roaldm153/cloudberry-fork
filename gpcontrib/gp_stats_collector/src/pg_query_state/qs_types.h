@@ -29,6 +29,9 @@
 #define QS_TYPES_H
 
 #include <stdint.h>
+#include <stdbool.h>
+
+#define GPSC_TRACE_ID_LEN 16
 
 /*
  * Execution phase of a single plan node as observed at signal time.
@@ -41,17 +44,6 @@ typedef enum QsNodeStatus
 	QS_NODE_STATUS_FINISHED    = 3   /* at least one full loop completed */
 } QsNodeStatus;
 
-/*
- * Per-node snapshot collected by qs_get_node_stats().
- *
- * All timing fields mirror the PostgreSQL Instrumentation struct and carry
- * the same semantics: startup/total/firsttuple are in seconds,
- * ntuples/tuplecount/nloops are raw counters.
- *
- * relation_oid is populated for scan nodes (SeqScan, IndexScan,
- * IndexOnlyScan, BitmapHeapScan, TidScan) by reading the range-table entry
- * via EState.es_range_table.  It is zero for all other node types.
- */
 typedef struct GpscNodeSample
 {
 	int32_t tmid;                    /* transaction/time id (gp_gettmid) */
@@ -62,6 +54,7 @@ typedef struct GpscNodeSample
 	int32_t node_tag;                /* nodeTag(plan) */
 	int32_t slice_id;                /* currentSliceId */
 	int32_t segindex;                /* GpIdentity.segindex */
+	int32_t pid;
 	int32_t dbid;					 /* GpIdentity.dbid */
 	int32_t relation_oid;            /* OID of scanned relation, or 0 */
 	double  plan_rows;               /* optimizer row estimate */
@@ -86,6 +79,10 @@ typedef struct GpscNodeSample
 	bool workfile_created;           /* Instrumentation.workfileCreated */
 	int64_t workmem_used;            /* Instrumentation.workmemused (bytes) */
 	int64_t workmem_wanted;          /* Instrumentation.workmemwanted (bytes); >0 == spilled */
+	double ntuples_delta;
+	double tuples_per_sec;
+	double time_since_init_sec;
+	bool stalled;
 } GpscNodeSample;
 
 #endif /* QS_TYPES_H */

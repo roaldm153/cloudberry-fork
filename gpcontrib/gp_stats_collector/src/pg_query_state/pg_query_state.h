@@ -150,14 +150,6 @@ typedef struct
 	int length;
 	PGPROC *proc;
 	PG_QS_RequestResult result_code;
-	/*
-	 * The target backend's own query key (from its gpsc_query_key), reported
-	 * back so the requestor can stamp QE-side per-node stats with the same
-	 * (tmid, ccnt) the QueryStat catalog uses.  The requestor runs a different
-	 * query (SELECT pg_query_state()), so it cannot derive these itself.
-	 */
-	int32 tmid;
-	int32 ccnt;
 	int number;
 	gp_segment_pid pids[FLEXIBLE_ARRAY_MEMBER];
 } backend_info;
@@ -171,15 +163,13 @@ typedef struct
 typedef struct
 {
 	ProcSignalReason reason;
-	int     reqid;
-	bool    verbose;
-	bool    costs;
-	bool    timing;
-	bool    buffers;
-	bool    triggers;
+	int reqid;
+	bool verbose;
+	bool costs;
+	bool timing;
+	bool buffers;
+	bool triggers;
 	ExplainFormat format;
-	int32_t tmid;
-	int32_t ccnt;
 } pg_qs_params;
 
 /*
@@ -191,6 +181,7 @@ typedef struct QsWalkerContext
 	List    *per_node_stats;
 	int32_t  parent_plan_node_id;
 	bool 	 finalize; /* true only in pg_qs_executor end */
+	TimestampTz ts_now;
 } QsWalkerContext;
 
 /*
@@ -210,6 +201,17 @@ extern List          *QueryDescStack;
 extern pg_qs_params  *params;
 extern shm_mq        *mq;
 extern uint32        *mq_req_id;
+
+/*
+ * Per-backend trace_id slots, indexed by BackendId (1..MaxBackends; slot 0 for
+ * InvalidBackendId is unused).  The single shared `params` cannot carry the
+ * trace across an asynchronous ProcSignal: two concurrent collections would
+ * clobber it and a signaled backend would stamp its batch with the wrong
+ * trace.  The dispatcher writes qs_trace_slots[target->backendId] before
+ * signalling; the signaled backend reads qs_trace_slots[MyBackendId] — its own
+ * slot, which no other collection touches.
+ */
+extern char (*qs_trace_slots)[GPSC_TRACE_ID_LEN];
 
 extern ProcSignalReason UserIdPollReason;
 extern ProcSignalReason QueryStatePollReason;
@@ -267,13 +269,15 @@ extern void qs_debug_node_sample(GpscNodeSample *sample);
  * per backend).  No-op on an empty list.  The caller must have invoked
  * gpsc_qs_sync_config() first.
  */
-extern void emit_node_batch(List *per_node_stats);
+extern void emit_node_batch(List *per_node_stats, const char *trace_id);
 
 /* Query filtering and miscellaneous helpers. */
 extern bool filter_query(QueryDesc *queryDesc);
 extern bool wait_for_mq_detached(shm_mq_handle *mqh);
 extern bool is_querystack_empty(void);
 extern QueryDesc *get_toppest_query(void);
+
+extern void gpsc_reset_node_roll_state(void);
 
 #ifdef __cplusplus
 }
