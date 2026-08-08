@@ -63,21 +63,8 @@ map_node_status(QsNodeStatus status)
 	}
 }
 
-/*
- * gpsc_emit_plan_batch -- serialize a whole plan-tree snapshot and send it.
- *
- * Builds one yagpcc::SetPerNodeBatchReq: the identity keys (query_key,
- * segment_key) and datetime are hoisted from nodes[0] and shared by every
- * BatchNode, then each sample becomes a flat BatchNode entry.  Delegates to
- * UDSConnector::report_per_node_batch() for framing (request_type=1) and a
- * single socket write.
- *
- * Parameters:
- *   nodes -- array of GpscNodeSample pointers (must be non-NULL when count>0)
- *   count -- number of entries; 0 is a no-op
- */
 extern "C" void
-gpsc_emit_plan_batch(GpscNodeSample **nodes, int count)
+gpsc_emit_node_batch(GpscNodeSample **nodes, int count, const char *trace_id)
 {
 	if (count <= 0)
 		return;
@@ -86,6 +73,7 @@ gpsc_emit_plan_batch(GpscNodeSample **nodes, int count)
 
 	/* Timestamp */
 	*request.mutable_datetime() = current_ts();
+	request.set_trace_id(trace_id, GPSC_TRACE_ID_LEN);
 
 	/* Hoisted identity keys -- identical for every node in one backend's pass. */
 	auto *qk = request.mutable_query_key();
@@ -102,6 +90,7 @@ gpsc_emit_plan_batch(GpscNodeSample **nodes, int count)
 		GpscNodeSample   *node = nodes[i];
 		yagpcc::BatchNode *bn  = request.add_nodes();
 
+		bn->set_pid(node->pid);
 		bn->set_plan_node_id(node->plan_node_id);
 		bn->set_parent_plan_node_id(node->parent_plan_node_id);
 		bn->set_node_type(node->node_tag);
@@ -129,19 +118,21 @@ gpsc_emit_plan_batch(GpscNodeSample **nodes, int count)
 		bn->set_workfile_created(node->workfile_created);
 		bn->set_workmem_used(node->workmem_used);
 		bn->set_workmem_wanted(node->workmem_wanted);
+		/*
+		 * Derived rate fields, computed in signal_handler from the per-node
+		 * rolling state (prev ntuples + prev executed_at). They MUST be
+		 * serialized here too: the receiver keys per invocation trace_id and
+		 * sees each node once, so it cannot re-derive a rate on its side.
+		 */
+		bn->set_ntuples_delta(node->ntuples_delta);
+		bn->set_tuples_per_sec(node->tuples_per_sec);
+		bn->set_time_since_init_sec(node->time_since_init_sec);
+		bn->set_stalled(node->stalled);
 	}
 
 	UDSConnector::report_per_node_batch(request, pne_config);
 }
 
-/*
- * gpsc_emit_query_plan -- serialize a plan document and send it.
- *
- * Builds one yagpcc::SetQueryPlanReq keyed by (tmid, ssid, ccnt) carrying the
- * ExplainPrintPlan text and the format it was rendered in, then delegates to
- * UDSConnector::report_query_plan() (request_type=2).  A NULL/empty plan_doc
- * is a no-op.
- */
 extern "C" void
 gpsc_emit_query_plan(int32_t tmid, int32_t ssid, int32_t ccnt,
 					 const char *plan_doc, int32_t format)

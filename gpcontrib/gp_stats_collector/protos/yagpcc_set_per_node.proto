@@ -40,10 +40,11 @@ package yagpcc;
  * api/proto/agent_segment/yagpcc_set_service.proto.
  */
 message SetPerNodeBatchReq {
-    google.protobuf.Timestamp    datetime    = 1;
-    QueryKey                     query_key   = 2;
-    SegmentKey                   segment_key = 3;
-    repeated BatchNode           nodes       = 4;
+    google.protobuf.Timestamp datetime    = 1;
+    QueryKey                  query_key   = 2;
+    SegmentKey                segment_key = 3;
+    repeated BatchNode        nodes       = 4;
+    bytes                     trace_id    = 5;
 }
 
 /*
@@ -70,15 +71,15 @@ message BatchNode {
     uint64         shared_blks_read    = 14;
     PlanNodeStatus node_status         = 15;
     bool           eof                 = 16;
-    /* executed_at: source-side wall-clock when gpsc computed this node. Drives
-     * per-node rate (tuples/sec) and time-since-init downstream; compared only
-     * within one (node, slice, segment) -- timestamps differ per segment host. */
     google.protobuf.Timestamp executed_at = 17;
-    /* per-node spill, straight from GP Instrumentation. Reliable at node
-     * finalize; a mid-run snapshot is a lower bound (esp. Sort/HashJoin). */
     bool           workfile_created    = 18;
     int64          workmem_used        = 19;   /* bytes of work_mem actually used */
     int64          workmem_wanted      = 20;   /* bytes needed to avoid spill; >0 == spilled */
+    double ntuples_delta = 21;
+    double tuples_per_sec = 22;
+    double time_since_init_sec = 23;
+    bool stalled = 24;
+    int32 pid = 25;
 }
 
 /*
