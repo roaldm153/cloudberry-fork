@@ -31,13 +31,13 @@ WHERE typnamespace = 'gpsc'::regnamespace
 --
 -- Negative: a backend cannot poll its own state.
 --
-SELECT gpsc.pg_query_state(pg_backend_pid());
+SELECT gpsc.pg_query_state(pg_backend_pid(), '\x00112233445566778899aabbccddeeff'::bytea);
 SELECT * FROM gpsc.pg_query_state_backends(pg_backend_pid());
 
 --
 -- Negative: a pid that maps to no live backend is rejected.
 --
-SELECT gpsc.pg_query_state(-1);
+SELECT gpsc.pg_query_state(-1, '\x00112233445566778899aabbccddeeff'::bytea);
 SELECT * FROM gpsc.pg_query_state_backends(-1);
 
 -- Cleanup

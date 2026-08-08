@@ -32,7 +32,8 @@ SELECT gp_wait_until_triggered_fault('executor_pre_tuple_processed', 1, dbid)
 2: SELECT gpsc.pg_query_state(
      (SELECT pid FROM pg_stat_activity
       WHERE application_name = 'qs_running_target' AND pid <> pg_backend_pid()
-      ORDER BY backend_start LIMIT 1));
+      ORDER BY backend_start LIMIT 1),
+     '\x00112233445566778899aabbccddeeff'::bytea);
 
 -- Release the fault and reap the suspended query.
 SELECT gp_inject_fault('executor_pre_tuple_processed', 'reset', dbid)

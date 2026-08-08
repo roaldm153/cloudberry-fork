@@ -37,7 +37,7 @@ SELECT gp_wait_until_triggered_fault('executor_pre_tuple_processed', 1, dbid)
 
 -- Non-superuser, non-owner: both entry points are denied.
 2: SET ROLE qs_unpriv;
-2: SELECT gpsc.pg_query_state((SELECT pid FROM qs_perm_pid));
+2: SELECT gpsc.pg_query_state((SELECT pid FROM qs_perm_pid), '\x00112233445566778899aabbccddeeff'::bytea);
 2: SELECT * FROM gpsc.pg_query_state_backends((SELECT pid FROM qs_perm_pid));
 2: RESET ROLE;
 

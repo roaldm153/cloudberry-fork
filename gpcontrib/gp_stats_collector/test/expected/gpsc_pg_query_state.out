@@ -22,8 +22,8 @@ WHERE pronamespace = 'gpsc'::regnamespace
 ORDER BY proname;
          proname         | pronargs | returns | proexeclocation 
 -------------------------+----------+---------+-----------------
- cbdb_mpp_query_state    |        1 | void    | a
- pg_query_state          |        1 | void    | c
+ cbdb_mpp_query_state    |        2 | void    | a
+ pg_query_state          |        2 | void    | c
  pg_query_state_backends |        1 | record  | c
 (3 rows)
 
@@ -40,14 +40,14 @@ WHERE typnamespace = 'gpsc'::regnamespace
 --
 -- Negative: a backend cannot poll its own state.
 --
-SELECT gpsc.pg_query_state(pg_backend_pid());
+SELECT gpsc.pg_query_state(pg_backend_pid(), '\x00112233445566778899aabbccddeeff'::bytea);
 ERROR:  cannot extract state of current process
 SELECT * FROM gpsc.pg_query_state_backends(pg_backend_pid());
 ERROR:  cannot extract state of current process
 --
 -- Negative: a pid that maps to no live backend is rejected.
 --
-SELECT gpsc.pg_query_state(-1);
+SELECT gpsc.pg_query_state(-1, '\x00112233445566778899aabbccddeeff'::bytea);
 ERROR:  backend with pid=-1 not found
 SELECT * FROM gpsc.pg_query_state_backends(-1);
 ERROR:  backend with pid=-1 not found
