@@ -144,8 +144,7 @@ uint32 *mq_req_id = NULL;
 
 /*
  * Per-backend trace_id slots (slot 3 in the toc), indexed by BackendId.  See
- * the header: each signaled backend reads its own slot so concurrent
- * collections never clobber each other's trace.
+ * the header: each signaled backend reads its own slot
  */
 char (*qs_trace_slots)[GPSC_TRACE_ID_LEN] = NULL;
 
@@ -436,26 +435,10 @@ pg_qs_executor_finish(QueryDesc *queryDesc)
 void
 pg_qs_executor_end(QueryDesc *queryDesc)
 {
-	QsWalkerContext *qs_walker_ctx;
-
-	if (!queryDesc)
-		return;
-
-	qs_walker_ctx = (QsWalkerContext *) palloc0(sizeof(QsWalkerContext));
-	qs_walker_ctx->finalize = true;
-	qs_walker_ctx->ts_now = GetCurrentTimestamp();
-	qs_planstate_walker(queryDesc->planstate, qs_get_node_stats,
-						qs_walker_ctx, 0);
-	qs_debug_node_stats(qs_walker_ctx->per_node_stats);
-
-	/*
-	 * Do NOT push to the yagpcc UDS sink here: a finishing query is not part of
-	 * any collection, so there is no trace_id to key it under — an unsolicited
-	 * push would land under a stale/other collection's trace and contaminate a
-	 * live graph.  The poll path already observes FINISHED nodes via the signal.
-	 */
-
-	gpsc_reset_node_roll_state();
+	if (queryDesc && pg_qs_enable)
+	{
+		gpsc_reset_node_roll_state();
+	}
 }
 
 /*
@@ -1058,8 +1041,10 @@ cbdb_mpp_query_state(PG_FUNCTION_ARGS)
 		PGPROC *proc = (PGPROC *) lfirst(iter);
 		int sig_result;
 
-		if (!proc)
+		if (!proc || proc->backendId == InvalidBackendId)
+		{
 			continue;
+		}
 
 		/* Stamp the target's own trace slot before signalling it. */
 		memcpy(qs_trace_slots[proc->backendId], VARDATA_ANY(trace_id),
@@ -1068,9 +1053,11 @@ cbdb_mpp_query_state(PG_FUNCTION_ARGS)
 		sig_result = SendProcSignal(proc->pid, QueryStatePollReason,
 									proc->backendId);
 		if (sig_result == -1)
+		{
 			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 							errmsg("cbdb_mpp_query_state: failed to send signal to pid %d",
 								   proc->pid)));
+		}
 	}
 	PG_RETURN_VOID();
 }

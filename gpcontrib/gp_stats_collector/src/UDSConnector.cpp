@@ -31,6 +31,9 @@
 #include "log/LogOps.h"
 #include "memory/gpdbwrappers.h"
 
+#include <cerrno>
+#include <ctime>
+#include <poll.h>
 #include <string>
 #include <sys/fcntl.h>
 #include <sys/socket.h>
@@ -56,6 +59,22 @@ extern "C" {
 static const uint32_t kExtendedProtocolFlag    = 0x80000000u;
 static const uint16_t kRequestTypePerNodeBatch = 1;
 static const uint16_t kRequestTypeQueryPlan    = 2;
+
+/*
+ * Bound on how long open_nonblocking_uds waits for a non-blocking connect() to
+ * finish when it returns EINPROGRESS/EAGAIN.  Kept short: a local UDS handshake
+ * completes almost immediately, and we would rather drop a sample than stall the
+ * backend during a connection burst.
+ */
+static const int kConnectTimeoutMs = 50;
+
+/*
+ * Overall bound on how long send_all keeps retrying a message when the UDS send
+ * buffer stays full (EAGAIN).  Backpressure is normal, but we must not block the
+ * backend indefinitely behind a stuck reader -- past this deadline we give up
+ * and drop the message.
+ */
+static const int kSendTimeoutMs = 200;
 
 /* ----------------------------------------------------------------
  * Error-logging helpers
@@ -145,35 +164,102 @@ open_nonblocking_uds(const std::string &uds_path, sockaddr_un &address)
 	if (connect(sockfd, reinterpret_cast<sockaddr *>(&address),
 				sizeof(address)) == -1)
 	{
-		GpscStat::report_bad_connection();
-		close(sockfd);
-		return -1;
+		if (errno != EINPROGRESS && errno != EAGAIN)
+		{
+			GpscStat::report_bad_connection();
+			close(sockfd);
+			return -1;
+		}
+
+		pollfd pfd = {};
+		pfd.fd	   = sockfd;
+		pfd.events = POLLOUT;
+
+		const int rc = poll(&pfd, 1, kConnectTimeoutMs);
+		if (rc <= 0)
+		{
+			GpscStat::report_bad_connection();
+			close(sockfd);
+			return -1;
+		}
+
+		int so_error = 0;
+		socklen_t len = sizeof(so_error);
+		if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_error, &len) == -1 ||
+			so_error != 0)
+		{
+			GpscStat::report_bad_connection();
+			close(sockfd);
+			return -1;
+		}
 	}
 
 	return sockfd;
 }
 
 /*
+ * monotonic_ms -- current CLOCK_MONOTONIC reading in milliseconds.
+ *
+ * Used for send_all's retry deadline; monotonic so it is immune to wall-clock
+ * jumps (NTP steps, settimeofday).
+ */
+static int64_t
+monotonic_ms(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/*
  * send_all -- write all `total_size` bytes from `buf` over `sockfd`.
  *
- * Uses MSG_DONTWAIT with a 1 ms sleep between partial sends to avoid
- * overflowing the UDS send buffer.  Returns true when all bytes have been
- * sent, false on error (errno is preserved).
+ * The socket is non-blocking and send() uses MSG_DONTWAIT.  A full send buffer
+ * reports EAGAIN/EWOULDBLOCK -- normal backpressure, not an error -- so on that
+ * we wait (bounded by kSendTimeoutMs) for the socket to become writable via
+ * poll(POLLOUT) and retry, rather than dropping the message.  EINTR retries
+ * immediately.  Returns true once every byte is sent, false on a hard error or
+ * once the deadline is exceeded (errno is preserved on the hard-error path).
  */
 static bool
 send_all(int sockfd, const uint8_t *buf, size_t total_size)
 {
-	int64_t sent = 0, sent_total = 0;
-	do
-	{
-		sent = send(sockfd, buf + sent_total, total_size - sent_total,
-					MSG_DONTWAIT);
-		if (sent > 0)
-			sent_total += sent;
-	} while (sent > 0 && size_t(sent_total) != total_size &&
-			 (pg_usleep(1000), true));
+	size_t        sent_total = 0;
+	const int64_t deadline   = monotonic_ms() + kSendTimeoutMs;
 
-	return sent >= 0;
+	while (sent_total < total_size)
+	{
+		const ssize_t sent = send(sockfd, buf + sent_total,
+								  total_size - sent_total, MSG_DONTWAIT);
+		if (sent > 0)
+		{
+			sent_total += (size_t) sent;
+			continue;
+		}
+
+		/* errno is only meaningful when send() actually failed (sent < 0). */
+		if (sent < 0 && errno == EINTR)
+			continue;
+		if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK)
+			return false; /* hard error */
+
+		/* Send buffer full (or a 0-byte return): wait, bounded, for drain. */
+		const int64_t remaining = deadline - monotonic_ms();
+		if (remaining <= 0)
+			return false; /* sustained backpressure: give up */
+
+		pollfd pfd = {};
+		pfd.fd	   = sockfd;
+		pfd.events = POLLOUT;
+
+		const int rc = poll(&pfd, 1, (int) remaining);
+		if (rc < 0 && errno == EINTR)
+			continue;
+		if (rc <= 0)
+			return false; /* poll error or timeout */
+	}
+
+	return true;
 }
 
 /* ----------------------------------------------------------------
