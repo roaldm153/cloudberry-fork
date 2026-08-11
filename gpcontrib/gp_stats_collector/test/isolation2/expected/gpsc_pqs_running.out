@@ -43,7 +43,7 @@ SELECT gp_wait_until_triggered_fault('executor_pre_tuple_processed', 1, dbid) FR
 --------------
  t            
 (1 row)
-2: SELECT gpsc.pg_query_state( (SELECT pid FROM pg_stat_activity WHERE application_name = 'qs_running_target' AND pid <> pg_backend_pid() ORDER BY backend_start LIMIT 1));
+2: SELECT gpsc.pg_query_state( (SELECT pid FROM pg_stat_activity WHERE application_name = 'qs_running_target' AND pid <> pg_backend_pid() ORDER BY backend_start LIMIT 1), '\x00112233445566778899aabbccddeeff'::bytea);
  pg_query_state 
 ----------------
                 

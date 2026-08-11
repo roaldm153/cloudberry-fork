@@ -53,7 +53,7 @@ INSERT 1
 -- Non-superuser, non-owner: both entry points are denied.
 2: SET ROLE qs_unpriv;
 SET
-2: SELECT gpsc.pg_query_state((SELECT pid FROM qs_perm_pid));
+2: SELECT gpsc.pg_query_state((SELECT pid FROM qs_perm_pid), '\x00112233445566778899aabbccddeeff'::bytea);
 ERROR:  permission denied
 2: SELECT * FROM gpsc.pg_query_state_backends((SELECT pid FROM qs_perm_pid));
 ERROR:  permission denied
