@@ -163,12 +163,12 @@ typedef struct
 typedef struct
 {
 	ProcSignalReason reason;
-	int reqid;
-	bool verbose;
-	bool costs;
-	bool timing;
-	bool buffers;
-	bool triggers;
+	int     reqid;
+	bool    verbose;
+	bool    costs;
+	bool    timing;
+	bool    buffers;
+	bool    triggers;
 	ExplainFormat format;
 } pg_qs_params;
 
@@ -196,7 +196,6 @@ typedef enum
 extern bool           pg_qs_enable;
 extern bool           pg_qs_timing;
 extern bool           pg_qs_buffers;
-extern bool           pg_qs_emit_on_finish;
 extern List          *QueryDescStack;
 extern pg_qs_params  *params;
 extern shm_mq        *mq;
@@ -208,8 +207,10 @@ extern uint32        *mq_req_id;
  * trace across an asynchronous ProcSignal: two concurrent collections would
  * clobber it and a signaled backend would stamp its batch with the wrong
  * trace.  The dispatcher writes qs_trace_slots[target->backendId] before
- * signalling; the signaled backend reads qs_trace_slots[MyBackendId] — its own
- * slot, which no other collection touches.
+ * signalling; the signaled backend reads qs_trace_slots[MyBackendId].  The slot
+ * is keyed by backend, not by collection, so two overlapping collections of the
+ * same backend still share one slot -- the caller must not poll one pid twice
+ * concurrently.
  */
 extern char (*qs_trace_slots)[GPSC_TRACE_ID_LEN];
 

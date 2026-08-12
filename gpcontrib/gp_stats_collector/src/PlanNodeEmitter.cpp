@@ -7,7 +7,7 @@
  * declared in PlanNodeEmitter.h and callable from plain C:
  *
  *   gpsc_qs_sync_config()   -- reload the Config singleton
- *   gpsc_emit_plan_batch()  -- serialize a plan-tree snapshot and send it
+ *   gpsc_emit_node_batch()  -- serialize a plan-tree snapshot and send it
  *   gpsc_emit_query_plan()  -- serialize a plan document and send it
  *
  * The outgoing message types are yagpcc::SetPerNodeBatchReq and
@@ -31,7 +31,7 @@ static Config pne_config;
 /*
  * gpsc_qs_sync_config -- reload the Config singleton.
  *
- * Must be called before a gpsc_emit_plan_batch() call so that the UDS path
+ * Must be called before a gpsc_emit_node_batch() call so that the UDS path
  * and other settings are up to date.  It is a no-op when the config has not
  * changed since the last call.
  */

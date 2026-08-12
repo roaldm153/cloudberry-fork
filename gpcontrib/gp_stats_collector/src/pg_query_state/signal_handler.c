@@ -112,8 +112,8 @@ static void ensure_node_roll_htab(void)
 	ctl.keysize = sizeof(int);
 	ctl.entrysize = sizeof(NodeRollState);
 	ctl.hcxt = TopMemoryContext;
-	node_roll_htab = hash_create("gpsc_per_node_roll_state", 
-		64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	node_roll_htab = hash_create("gpsc_per_node_roll_state",
+								 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 }
 
 void gpsc_reset_node_roll_state(void)
@@ -338,7 +338,7 @@ qs_get_node_stats(PlanState *planstate, QsWalkerContext *qs_walker_ctx)
 	nodestat->slice_id            = currentSliceId;
 	nodestat->segindex            = GpIdentity.segindex;
 	nodestat->dbid                = GpIdentity.dbid;
-	nodestat->pid 				  = MyProcPid;
+	nodestat->pid                 = MyProcPid;
 
 	/* Planner estimate. */
 	nodestat->plan_rows = planstate->plan->plan_rows;
@@ -463,7 +463,7 @@ qs_get_node_stats(PlanState *planstate, QsWalkerContext *qs_walker_ctx)
 
 		rs = (NodeRollState *) hash_search(node_roll_htab,
 			&nodestat->plan_node_id, HASH_ENTER, &found);
-		
+
 		if (found)
 		{
 			double dt = (double) (ts_now - rs->prev_executed_at) / USECS_PER_SEC;
@@ -478,8 +478,8 @@ qs_get_node_stats(PlanState *planstate, QsWalkerContext *qs_walker_ctx)
 			nodestat->time_since_init_sec = 0;
 			rs->first_executed_at = ts_now;
 		}
-		nodestat->stalled = (nodestat->ntuples_delta == 0 
-				&& nodestat->node_status == QS_NODE_STATUS_EXECUTING 
+		nodestat->stalled = (nodestat->ntuples_delta == 0
+				&& nodestat->node_status == QS_NODE_STATUS_EXECUTING
 				&& !nodestat->eof);
 		rs->prev_ntuples_sum = cur_sum;
 		rs->prev_executed_at = ts_now;
@@ -679,10 +679,12 @@ SendQueryState(void)
 
 		/*
 		 * Emit the whole plan-tree snapshot as a single batch: one UDS
-		 * connection per backend instead of connect+send+close per node.  Read
-		 * THIS backend's own trace slot (stamped by the dispatcher before the
-		 * signal) — never a shared slot, so a concurrent collection cannot
-		 * clobber the key this batch lands under.
+		 * connection per backend instead of connect+send+close per node.  Key it
+		 * under this backend's own trace slot, stamped by the dispatcher before
+		 * the signal.  The slot is per-backend, so distinct backends never
+		 * collide; two overlapping collections of the *same* backend still share
+		 * one slot and can race, so the caller must not poll one pid twice
+		 * concurrently.
 		 */
 		emit_node_batch(qs_result, qs_trace_slots[MyBackendId]);
 
@@ -700,7 +702,7 @@ SendQueryState(void)
 			bool	is_same_query;
 			bool	is_stale;
 			int32_t tmid;
-		
+
 			gp_gettmid(&tmid);
 			is_same_query = (tmid == last_sent_query_key.tmid &&
 							 gp_session_id == last_sent_query_key.ssid &&

@@ -54,7 +54,7 @@ typedef struct GpscNodeSample
 	int32_t node_tag;                /* nodeTag(plan) */
 	int32_t slice_id;                /* currentSliceId */
 	int32_t segindex;                /* GpIdentity.segindex */
-	int32_t pid;
+	int32_t pid;                     /* MyProcPid of the sampled backend */
 	int32_t dbid;					 /* GpIdentity.dbid */
 	int32_t relation_oid;            /* OID of scanned relation, or 0 */
 	double  plan_rows;               /* optimizer row estimate */
@@ -79,10 +79,15 @@ typedef struct GpscNodeSample
 	bool workfile_created;           /* Instrumentation.workfileCreated */
 	int64_t workmem_used;            /* Instrumentation.workmemused (bytes) */
 	int64_t workmem_wanted;          /* Instrumentation.workmemwanted (bytes); >0 == spilled */
-	double ntuples_delta;
-	double tuples_per_sec;
-	double time_since_init_sec;
-	bool stalled;
+	/*
+	 * Derived rate fields, computed in signal_handler from the per-node rolling
+	 * state (previous ntuples and sample time) rather than read from
+	 * Instrumentation.  Zero on the node's first sample.
+	 */
+	double ntuples_delta;            /* tuples produced since the previous sample */
+	double tuples_per_sec;           /* ntuples_delta divided by the sample interval */
+	double time_since_init_sec;      /* seconds since the node's first sample */
+	bool stalled;                    /* executing but produced no new tuples and not at eof */
 } GpscNodeSample;
 
 #endif /* QS_TYPES_H */

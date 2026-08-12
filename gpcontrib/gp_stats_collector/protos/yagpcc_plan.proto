@@ -18,6 +18,8 @@
 
 syntax = "proto3";
 
+import "google/protobuf/timestamp.proto";
+
 package yagpcc;
 
 message SetQueryPlanReq {

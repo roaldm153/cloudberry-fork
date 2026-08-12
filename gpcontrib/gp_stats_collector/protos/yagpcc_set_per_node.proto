@@ -74,10 +74,10 @@ message BatchNode {
     bool           workfile_created    = 18;
     int64          workmem_used        = 19;   /* bytes of work_mem actually used */
     int64          workmem_wanted      = 20;   /* bytes needed to avoid spill; >0 == spilled */
-    double ntuples_delta = 21;
-    double tuples_per_sec = 22;
-    double time_since_init_sec = 23;
-    bool stalled = 24;
-    int32 pid = 25;
+    double         ntuples_delta       = 21;   /* tuples produced since the previous sample */
+    double         tuples_per_sec      = 22;   /* ntuples_delta over the sample interval */
+    double         time_since_init_sec = 23;   /* seconds since the node's first sample */
+    bool           stalled             = 24;   /* executing, no new tuples, not at eof */
+    int32          pid                 = 25;
 }
 
