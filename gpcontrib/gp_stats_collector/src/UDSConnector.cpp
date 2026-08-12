@@ -95,14 +95,24 @@ log_query_failure(const gpsc::SetQueryReq &req, const std::string &event)
 
 /*
  * log_per_node_batch_failure -- emit a LOG message for a failed
- * SetPerNodeBatchReq send.  Includes the query key and node count.
+ * SetPerNodeBatchReq send.  Includes the hex trace_id and node count.
  */
 static void inline
 log_per_node_batch_failure(const yagpcc::SetPerNodeBatchReq &req)
 {
-	ereport(LOG, (errmsg("Query {%d-%d-%d} per-node batch tracing (%d nodes) failed with error %m",
-						 req.query_key().tmid(), req.query_key().ssid(),
-						 req.query_key().ccnt(), req.nodes_size())));
+	static const char hexchars[] = "0123456789abcdef";
+	const std::string &tid = req.trace_id();
+	std::string hex;
+
+	hex.reserve(tid.size() * 2);
+	for (unsigned char c : tid)
+	{
+		hex.push_back(hexchars[c >> 4]);
+		hex.push_back(hexchars[c & 0x0f]);
+	}
+
+	ereport(LOG, (errmsg("Per-node batch {trace_id=%s} tracing (%d nodes) failed with error %m",
+						 hex.c_str(), req.nodes_size())));
 }
 
 /*
