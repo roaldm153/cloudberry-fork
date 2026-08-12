@@ -41,10 +41,9 @@ package yagpcc;
  */
 message SetPerNodeBatchReq {
     google.protobuf.Timestamp datetime    = 1;
-    QueryKey                  query_key   = 2;
-    SegmentKey                segment_key = 3;
-    repeated BatchNode        nodes       = 4;
-    bytes                     trace_id    = 5;
+    SegmentKey                segment_key = 2;
+    repeated BatchNode        nodes       = 3;
+    bytes                     trace_id    = 4;
 }
 
 /*
@@ -82,21 +81,3 @@ message BatchNode {
     int32 pid = 25;
 }
 
-/*
- * SetQueryPlanReq -- coordinator-only ExplainPrintPlan document for a query.
- *
- * Emitted once per poll from the QD (Gp_role == GP_ROLE_DISPATCH) via the
- * extended UDS protocol with request_type=2.  Carries the full deparsed plan
- * (expressions, costs, Settings) that the compact per-node stats cannot
- * reconstruct.  Keyed by query_key only; it is a whole-query artifact, not
- * per-segment.  Last write wins on the yagpcc side.
- *
- * This message MUST stay byte-identical to the yagpcc-side definition in
- * api/proto/agent_segment/yagpcc_set_service.proto.
- */
-message SetQueryPlanReq {
-    google.protobuf.Timestamp    datetime  = 1;
-    QueryKey                     query_key = 2;
-    string                       plan_doc  = 3;   /* ExplainPrintPlan output */
-    int32                        format    = 4;   /* ExplainFormat: 0=text 1=xml 2=json 3=yaml */
-}

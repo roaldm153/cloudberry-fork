@@ -75,12 +75,6 @@ gpsc_emit_node_batch(GpscNodeSample **nodes, int count, const char *trace_id)
 	*request.mutable_datetime() = current_ts();
 	request.set_trace_id(trace_id, GPSC_TRACE_ID_LEN);
 
-	/* Hoisted identity keys -- identical for every node in one backend's pass. */
-	auto *qk = request.mutable_query_key();
-	qk->set_tmid(nodes[0]->tmid);
-	qk->set_ssid(nodes[0]->ssid);
-	qk->set_ccnt(nodes[0]->ccnt);
-
 	auto *sk = request.mutable_segment_key();
 	sk->set_dbid(nodes[0]->dbid);
 	sk->set_segindex(nodes[0]->segindex);

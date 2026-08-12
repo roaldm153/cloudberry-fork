@@ -20,6 +20,13 @@ syntax = "proto3";
 
 package yagpcc;
 
+message SetQueryPlanReq {
+    google.protobuf.Timestamp    datetime  = 1;
+    QueryKey                     query_key = 2;
+    string                       plan_doc  = 3;   /* ExplainPrintPlan output */
+    int32                        format    = 4;   /* ExplainFormat: 0=text 1=xml 2=json 3=yaml */
+}
+
 /*
  * Execution status of a single plan node.
  *
