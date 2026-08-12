@@ -86,7 +86,7 @@
 bool pg_qs_enable  = true;
 
 /* Collect timing (wall-clock) data in addition to row counts. */
-bool pg_qs_timing  = false;
+bool pg_qs_timing  = true;
 
 /* Collect buffer usage via Instrumentation.bufusage. */
 bool pg_qs_buffers = true;
@@ -305,7 +305,7 @@ pg_qs_init(void)
 							 "Collect timing data, not just row counts.",
 							 NULL,
 							 &pg_qs_timing,
-							 false,
+							 true,
 							 PGC_SUSET,
 							 0,
 							 NULL, NULL, NULL);
@@ -974,6 +974,23 @@ pg_query_state_backends(PG_FUNCTION_ARGS)
 
 		values[0] = Int32GetDatum(segpid->segid);
 		values[1] = Int32GetDatum(segpid->pid);
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+	}
+
+	/*
+	 * QD-only query (INSERT ... VALUES, catalog reads, and other coordinator-
+	 * local plans): no QE gang ran, so backend_info is empty even though the
+	 * coordinator is executing and will push its own per-node batch.  Report the
+	 * coordinator itself (segindex -1) so the caller does not mistake an empty
+	 * QE list for a finished query and drop the QD's batch.
+	 */
+	if (list_length(backend_info) == 0)
+	{
+		Datum   values[2];
+		bool    nulls[2] = {false, false};
+
+		values[0] = Int32GetDatum(GpIdentity.segindex);
+		values[1] = Int32GetDatum(proc->pid);
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}
 
