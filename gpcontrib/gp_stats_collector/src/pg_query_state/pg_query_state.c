@@ -24,7 +24,6 @@
  *   - Shared-memory setup (shm_toc segment with params, mq, mq_req_id).
  *   - Custom ProcSignal registrations for three signals:
  *       QueryStatePollReason  -> SendQueryState()
- *       UserIdPollReason      -> SendCurrentUserId()
  *       BackendInfoPollReason -> SendCdbComponents()
  *   - GUC variables: pg_query_state.enable / enable_timing / enable_buffers.
  *   - Executor lifecycle hooks (start/run/finish/end) that maintain the
@@ -142,7 +141,6 @@ char (*qs_trace_slots)[GPSC_TRACE_ID_LEN] = NULL;
 /* Global signal-reason handles (set during pg_qs_init) */
 List *QueryDescStack = NIL;
 
-ProcSignalReason UserIdPollReason      = INVALID_PROCSIGNAL;
 ProcSignalReason QueryStatePollReason  = INVALID_PROCSIGNAL;
 ProcSignalReason BackendInfoPollReason = INVALID_PROCSIGNAL;
 
@@ -279,13 +277,11 @@ pg_qs_init(void)
 	RequestAddinShmemSpace(pg_qs_shmem_size());
 #endif
 
-	UserIdPollReason      = RegisterCustomProcSignalHandler(SendCurrentUserId);
 	QueryStatePollReason  = RegisterCustomProcSignalHandler(SendQueryState);
 	BackendInfoPollReason = RegisterCustomProcSignalHandler(SendCdbComponents);
 
 	if (QueryStatePollReason  == INVALID_PROCSIGNAL ||
-		BackendInfoPollReason == INVALID_PROCSIGNAL ||
-		UserIdPollReason      == INVALID_PROCSIGNAL)
+		BackendInfoPollReason == INVALID_PROCSIGNAL)
 	{
 		ereport(WARNING, (errcode(ERRCODE_INSUFFICIENT_RESOURCES),
 						  errmsg("pg_query_state isn't loaded: insufficient custom ProcSignal slots")));
@@ -420,11 +416,6 @@ pg_qs_executor_end(QueryDesc *queryDesc)
 		gpsc_reset_node_roll_state();
 }
 
-/*
- * push_query -- add a QueryDesc to the top of the stack.
- *
- * Also increments qs_query_count for synthetic queryId generation.
- */
 static void
 push_query(QueryDesc *queryDesc)
 {
@@ -451,18 +442,12 @@ pg_qs_pop_query(void)
 	QueryDescStack = list_delete_first(QueryDescStack);
 }
 
-/*
- * is_querystack_empty -- return true when no query is currently executing.
- */
 bool
 is_querystack_empty(void)
 {
 	return list_length(QueryDescStack) == 0;
 }
 
-/*
- * get_toppest_query -- return the most-recently-pushed QueryDesc, or NULL.
- */
 QueryDesc *
 get_toppest_query(void)
 {
@@ -486,7 +471,7 @@ filter_query(QueryDesc *queryDesc)
 	if (queryDesc->extended_query && queryDesc->portal_name)
 	{
 		portal = GetPortalByName(queryDesc->portal_name);
-		if (portal->cursorOptions != CURSOR_OPT_NO_SCROLL)
+		if (!PointerIsValid(portal) || portal->cursorOptions != CURSOR_OPT_NO_SCROLL)
 			return false;
 	}
 
@@ -760,6 +745,7 @@ receive_msg_by_parts(shm_mq_handle *mqh, Size *total, void **datap,
 	Assert(len == sizeof(Size));
 
 	expected_data = *expected;
+	Assert(expected_data < UINT32_MAX);
 	*datap = palloc0(expected_data);
 
 	/* Reassemble chunks until we have expected_data bytes. */
@@ -813,7 +799,6 @@ pg_query_state(PG_FUNCTION_ARGS)
 	LOCKTAG              tag;
 	PG_QS_RequestResult  result;
 	List                *backend_info = NIL;
-	Oid					 counterpart_user_id;
 
 	if (VARSIZE_ANY_EXHDR(trace_id) != GPSC_TRACE_ID_LEN)
 		ereport(ERROR,
@@ -836,17 +821,25 @@ pg_query_state(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("backend with pid=%d not found", pid)));
 
-	counterpart_user_id = proc->roleId;
-	if (!(superuser() || GetUserId() == counterpart_user_id))
+	if (!(superuser() || GetUserId() == proc->roleId))
 	{
 		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 						errmsg("permission denied")));
 	}
 
 	LockShmem(&tag, PG_QS_RCV_KEY);
-	reqid = *mq_req_id + 1;
-	result = GetRemoteBackendInfo(proc, &backend_info);
-	UnlockShmem(&tag);
+	PG_TRY();
+	{
+		reqid = *mq_req_id + 1;
+		result = GetRemoteBackendInfo(proc, &backend_info);
+		UnlockShmem(&tag);
+	}
+	PG_CATCH();
+	{
+		UnlockShmem(&tag);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	switch (result)
 	{
@@ -907,7 +900,6 @@ pg_query_state_backends(PG_FUNCTION_ARGS)
 	LOCKTAG              tag;
 	PG_QS_RequestResult  info_result;
 	ListCell            *lc;
-	Oid					 counterpart_user_id;
 
 	/* Standard set-returning-function materialize-mode preamble. */
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
@@ -950,17 +942,25 @@ pg_query_state_backends(PG_FUNCTION_ARGS)
 				 errmsg("pg_query_state must be loaded via shared_preload_libraries")));
 	}
 
-	counterpart_user_id = proc->roleId;
-	if (!(superuser() || GetUserId() == counterpart_user_id))
+	if (!(superuser() || GetUserId() == proc->roleId))
 	{
 		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 						errmsg("permission denied")));
 	}
 
 	LockShmem(&tag, PG_QS_RCV_KEY);
-	reqid = *mq_req_id + 1;
-	info_result = GetRemoteBackendInfo(proc, &backend_info);
-	UnlockShmem(&tag);
+	PG_TRY();
+	{
+		reqid = *mq_req_id + 1;
+		info_result = GetRemoteBackendInfo(proc, &backend_info);
+		UnlockShmem(&tag);
+	}
+	PG_CATCH();
+	{
+		UnlockShmem(&tag);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	/* Not running / disabled: return an empty set rather than erroring. */
 	if (info_result != QS_RETURNED)
@@ -1077,29 +1077,32 @@ get_query_backend_info(ArrayType *array)
 
 	for (int i = 0; i < len; i++)
 	{
+		if (nulls[i])
+			continue;
+
 		HeapTupleHeader td = DatumGetHeapTupleHeader(data[i]);
-		TupleDesc       tupDesc;
+		TupleDesc       tupdesc;
 		HeapTupleData   tmptup;
 		int32           pid;
 		int32           segid;
-		bool            isnull = false;
+		bool            segid_isnull = false;
+		bool            pid_isnull = false;
 		PGPROC         *proc;
 
-		tupDesc = lookup_rowtype_tupdesc_copy(
+		tupdesc = lookup_rowtype_tupdesc_copy(
 			HeapTupleHeaderGetTypeId(td), HeapTupleHeaderGetTypMod(td));
 		tmptup.t_len  = HeapTupleHeaderGetDatumLength(td);
 		tmptup.t_data = td;
 
-		segid = DatumGetInt32(heap_getattr(&tmptup, 1, tupDesc, &isnull));
-		if (isnull || segid != GpIdentity.segindex)
-			continue;
+		segid = DatumGetInt32(heap_getattr(&tmptup, 1, tupdesc, &segid_isnull));
+		pid   = DatumGetInt32(heap_getattr(&tmptup, 2, tupdesc, &pid_isnull));
+		FreeTupleDesc(tupdesc);
 
-		pid = DatumGetInt32(heap_getattr(&tmptup, 2, tupDesc, &isnull));
-		if (isnull)
+		if (segid_isnull || pid_isnull || segid != GpIdentity.segindex)
 			continue;
 
 		proc = BackendPidGetProc(pid);
-		if (proc == NULL)
+		if (!proc)
 			continue;
 
 		alive_procs = lappend(alive_procs, proc);

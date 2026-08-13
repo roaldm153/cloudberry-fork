@@ -62,7 +62,7 @@ extern "C" {
 #define NUM_OF_ATTEMPTS     6
 
 /* Bitmask flags for caller-side warnings embedded in shm_mq_msg.warnings. */
-#define TIMINIG_OFF_WARNING 1
+#define TIMING_OFF_WARNING 1
 #define BUFFERS_OFF_WARNING 2
 
 /* Unique key that identifies our shm_toc segment. */
@@ -116,19 +116,10 @@ typedef struct
 	int length;           /* total message size including flexible array */
 	PGPROC *proc;
 	PG_QS_RequestResult result_code;
-	int warnings;         /* bitmask of TIMINIG_OFF_WARNING / BUFFERS_OFF_WARNING */
+	int warnings;         /* bitmask of TIMING_OFF_WARNING / BUFFERS_OFF_WARNING */
 	int stack_depth;
 	char stack[FLEXIBLE_ARRAY_MEMBER];
 } shm_mq_msg;
-
-/*
- * Wire format for the user-id polling reply.
- */
-typedef struct
-{
-	Oid    userid;
-	uint32 reqid;
-} shm_mq_userid_msg;
 
 #define BASE_SIZEOF_SHM_MQ_MSG (offsetof(shm_mq_msg, stack_depth))
 
@@ -214,7 +205,6 @@ extern uint32        *mq_req_id;
  */
 extern char (*qs_trace_slots)[GPSC_TRACE_ID_LEN];
 
-extern ProcSignalReason UserIdPollReason;
 extern ProcSignalReason QueryStatePollReason;
 extern ProcSignalReason BackendInfoPollReason;
 
@@ -242,7 +232,6 @@ extern void pg_qs_push_query(QueryDesc *);
 
 /* Custom signal handlers registered with RegisterCustomProcSignalHandler. */
 extern void SendQueryState(void);
-extern void SendCurrentUserId(void);
 extern void SendCdbComponents(void);
 
 /* Shared-memory lock helpers. */

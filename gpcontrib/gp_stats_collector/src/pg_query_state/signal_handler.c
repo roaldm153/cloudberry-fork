@@ -28,8 +28,6 @@
  *                          logs them, then pushes the whole snapshot to the
  *                          yagpcc UDS sink (and, on the coordinator, the
  *                          deparsed plan document).
- *   SendCurrentUserId() -- fired when UserIdPollReason is received.
- *                          Sends the current effective user-id through shm_mq.
  *   SendCdbComponents() -- fired when BackendInfoPollReason is received (QD only).
  *                          Sends the list of active QE (segid, pid) pairs.
  *
@@ -607,24 +605,24 @@ static char *
 build_plan_doc(QueryDesc *queryDesc, ExplainFormat format)
 {
 	ExplainState   *es;
-	volatile int32	savedInterruptHoldoffCount;
 
 	if (queryDesc == NULL)
 		return NULL;
 
-	savedInterruptHoldoffCount = InterruptHoldoffCount;
-	es = NewExplainState();
-	es->format  = format;
-	es->verbose = true;
-	es->costs   = true;
-	es->runtime = true;
-
-	ExplainBeginOutput(es);
-	ExplainOpenGroup("Query", NULL, true, es);
-	ExplainPrintPlan(es, queryDesc);
-	ExplainCloseGroup("Query", NULL, true, es);
-	ExplainEndOutput(es);
-	InterruptHoldoffCount = savedInterruptHoldoffCount;
+	HOLD_INTERRUPTS();
+	{
+		es = NewExplainState();
+		es->format  = format;
+		es->verbose = true;
+		es->costs   = true;
+		es->runtime = true;
+		ExplainBeginOutput(es);
+		ExplainOpenGroup("Query", NULL, true, es);
+		ExplainPrintPlan(es, queryDesc);
+		ExplainCloseGroup("Query", NULL, true, es);
+		ExplainEndOutput(es);
+	}
+	RESUME_INTERRUPTS();
 
 	return es->str->data;
 }
@@ -739,43 +737,6 @@ SendQueryState(void)
 }
 
 /*
- * SendCurrentUserId -- handler for UserIdPollReason.
- *
- * Sends a shm_mq_userid_msg containing the current effective user-id through
- * the shared mq so the requestor can verify the target backend's identity.
- */
-void
-SendCurrentUserId(void)
-{
-	shm_mq_handle     *mqh;
-	shm_mq_userid_msg  msg;
-	LOCKTAG            tag;
-
-	msg.userid = GetUserId();
-
-	LockShmem(&tag, PG_QS_SND_KEY);
-	mqh        = shm_mq_attach(mq, NULL, NULL);
-	msg.reqid  = *mq_req_id;
-
-	if (shm_mq_get_sender(mq) != MyProc ||
-		params->reason != UserIdPollReason)
-	{
-		elog(WARNING, "pg_query_state: SendCurrentUserId: stale or mismatched request");
-	}
-	else if (send_msg_by_parts(mqh, sizeof(msg), &msg) != MSG_BY_PARTS_SUCCEEDED)
-	{
-		elog(WARNING, "pg_query_state: SendCurrentUserId: failed to send reply");
-	}
-
-#if PG_VERSION_NUM < 100000
-	shm_mq_detach(mq);
-#else
-	shm_mq_detach(mqh);
-#endif
-	UnlockShmem(&tag);
-}
-
-/*
  * fill_segpid -- populate consecutive gp_segment_pid slots from one CDB segment.
  *
  * Iterates the activelist of segInfo and fills msg->pids starting at *index,
@@ -815,14 +776,13 @@ SendCdbComponents(void)
 	msg_by_parts_result   send_result;
 	MemoryContext         oldctx;
 	int                   index = 0;
-	volatile int32        savedInterruptHoldoffCount;
 	MemoryContext         query_state_ctx =
 		AllocSetContextCreate(TopMemoryContext,
 							  "pg_query_state SendCdbComponents",
 							  ALLOCSET_DEFAULT_SIZES);
 
+	HOLD_INTERRUPTS();
 	oldctx = MemoryContextSwitchTo(query_state_ctx);
-	savedInterruptHoldoffCount = InterruptHoldoffCount;
 
 	PG_TRY();
 	{
@@ -896,13 +856,20 @@ SendCdbComponents(void)
 	PG_CATCH();
 	{
 		elog(WARNING, "pg_query_state: SendCdbComponents: error during send");
-		elog_dismiss(WARNING);
-		if (mqh)
-			shm_mq_detach(mqh);
-		InterruptHoldoffCount = savedInterruptHoldoffCount;
+		if (!elog_dismiss(WARNING))
+		{
+			if (mqh)
+				shm_mq_detach(mqh);
+
+			MemoryContextSwitchTo(oldctx);
+			MemoryContextDelete(query_state_ctx);
+			RESUME_INTERRUPTS();
+			PG_RE_THROW();
+		}
 	}
 	PG_END_TRY();
 
 	MemoryContextSwitchTo(oldctx);
 	MemoryContextDelete(query_state_ctx);
+	RESUME_INTERRUPTS();
 }
