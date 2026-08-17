@@ -32,6 +32,7 @@
 #include <stdbool.h>
 
 #define GPSC_TRACE_ID_LEN 16
+#define MAX_RELNAME_LEN 64
 
 /*
  * Execution phase of a single plan node as observed at signal time.
@@ -88,6 +89,7 @@ typedef struct GpscNodeSample
 	double tuples_per_sec;           /* ntuples_delta divided by the sample interval */
 	double time_since_init_sec;      /* seconds since the node's first sample */
 	bool stalled;                    /* executing but produced no new tuples and not at eof */
+	char relation_name[MAX_RELNAME_LEN];
 } GpscNodeSample;
 
 #endif /* QS_TYPES_H */

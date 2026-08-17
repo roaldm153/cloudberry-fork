@@ -65,6 +65,7 @@
 #include "nodes/execnodes.h"
 #include "nodes/plannodes.h"
 #include "pgstat.h"
+#include "parser/parsetree.h"
 #include "storage/bufmgr.h"
 #include "storage/lock.h"
 #include "utils/builtins.h"
@@ -72,6 +73,7 @@
 #include "utils/rel.h"
 #include "utils/timestamp.h"
 #include "utils/hsearch.h"
+#include "utils/lsyscache.h"
 #include "libpq/pqmq.h"
 
 /*
@@ -414,35 +416,50 @@ qs_get_node_stats(PlanState *planstate, QsWalkerContext *qs_walker_ctx)
 		nodestat->node_status = QS_NODE_STATUS_INITIALIZED;
 	}
 
-	/*
-	 * Populate relation_oid for scan nodes by looking up the range-table
-	 * entry using the node's scanrelid.  EState.es_range_table is a flat
-	 * List<RangeTblEntry *> indexed 1-based by scanrelid.
-	 */
+	Index rti = 0;
 	switch (nodeTag(planstate->plan))
-	{
+    {
 		case T_SeqScan:
+		case T_DynamicSeqScan:
+		case T_SampleScan:
 		case T_IndexScan:
+		case T_DynamicIndexScan:
+		case T_DynamicIndexOnlyScan:
 		case T_IndexOnlyScan:
 		case T_BitmapHeapScan:
+		case T_DynamicBitmapHeapScan:
 		case T_TidScan:
+		case T_TidRangeScan:
+		case T_ForeignScan:
+		case T_DynamicForeignScan:
+		case T_CustomScan:
+				rti = ((Scan *) planstate->plan)->scanrelid;
+				break;
+		case T_ModifyTable:
+				rti = ((ModifyTable *) planstate->plan)->nominalRelation;
+				break;
+		default:
+				break;
+    }
+
+	if (rti > 0 && planstate->state) 
+	{
+		List *rtable = planstate->state->es_range_table;
+		char *relname = NULL;
+		if (rti <= (Index) list_length(rtable))
 		{
-			Index scanrelid = ((Scan *) planstate->plan)->scanrelid;
-			if (scanrelid > 0 && planstate->state != NULL)
+			RangeTblEntry *rte = rt_fetch(rti, rtable);
+			if (rte->rtekind == RTE_RELATION)
 			{
-				List *rtable = planstate->state->es_range_table;
-				if (scanrelid <= (Index) list_length(rtable))
+				nodestat->relation_oid = (int32_t)rte->relid;
+				relname = get_rel_name(rte->relid);
+				if (relname)
 				{
-					RangeTblEntry *rte = (RangeTblEntry *)
-						list_nth(rtable, (int) scanrelid - 1);
-					if (rte->rtekind == RTE_RELATION)
-						nodestat->relation_oid = (int32_t) rte->relid;
+					strlcpy(nodestat->relation_name, relname, MAX_RELNAME_LEN);
+					pfree(relname);
 				}
 			}
-			break;
 		}
-		default:
-			break;
 	}
 
 	qs_walker_ctx->per_node_stats =

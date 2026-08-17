@@ -79,5 +79,8 @@ message BatchNode {
     double         time_since_init_sec = 23;   /* seconds since the node's first sample */
     bool           stalled             = 24;   /* executing, no new tuples, not at eof */
     int32          pid                 = 25;
+    reserved                             26;
+    reserved      "segindex";
+    string         relation_name       = 27;
 }
 

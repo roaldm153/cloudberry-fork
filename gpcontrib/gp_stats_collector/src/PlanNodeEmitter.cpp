@@ -101,6 +101,7 @@ gpsc_emit_node_batch(GpscNodeSample **nodes, int count, const char *trace_id)
 		bn->set_shared_blks_read(node->shared_blks_read);
 		bn->set_node_status(map_node_status(node->node_status));
 		bn->set_eof(node->eof);
+		bn->set_relation_name(node->relation_name);
 		/*
 		 * executed_at is the snapshot instant, shared by every node in this
 		 * pass. It is stamped per node (not at message level) because the
