@@ -130,7 +130,8 @@ jobs:
             source /usr/local/cloudberry-db/cloudberry-env.sh && \
             source gpAux/gpdemo/gpdemo-env.sh && \
             gpconfig -c shared_preload_libraries -v 'gp_stats_collector' && \
-            gpstop -ra"
+            gpstop -ar && \
+            sleep 10"
           # Phase 2: enable every logging/polling knob, then restart again.
           su - gpadmin -c "cd ${SRC_DIR} && \
             source /usr/local/cloudberry-db/cloudberry-env.sh && \
@@ -144,7 +145,8 @@ jobs:
             gpconfig -c gpsc.report_nested_queries -v on && \
             gpconfig -c gpsc.logging_mode -v UDS && \
             gpconfig -c gpsc.uds_path -v ${UDS_PATH} && \
-            gpstop -ra"
+            gpstop -ar && \
+            sleep 10"
 
       - name: Start UDS drain
         shell: bash
