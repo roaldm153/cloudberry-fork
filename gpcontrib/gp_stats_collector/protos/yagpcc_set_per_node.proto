@@ -82,5 +82,6 @@ message BatchNode {
     reserved                             26;
     reserved      "segindex";
     string         relation_name       = 27;
+    int32          ccnt                = 28;
 }
 

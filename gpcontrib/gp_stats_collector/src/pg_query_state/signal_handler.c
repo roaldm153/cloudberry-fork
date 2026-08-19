@@ -354,19 +354,6 @@ qs_get_node_stats(PlanState *planstate, QsWalkerContext *qs_walker_ctx)
 			InstrEndLoop(instr);
 		}
 
-		/*
-		 * Effective number of completed passes.  instr->nloops counts only the
-		 * loops closed by InstrEndLoop, which for a top-level node does not fire
-		 * until executor shutdown, so a scan that has already exhausted its
-		 * single pass mid-query still reads 0 -- any nloops-based "done" check
-		 * stays blind to a scan we can otherwise see has ended.  instr->eof marks
-		 * that the current pass has finished producing, so fold it in here: this
-		 * surfaces "one pass done" the instant a scan hits eof, and gives a
-		 * rescanning node its in-progress pass too.  We must not call
-		 * InstrEndLoop ourselves to force this -- it mutates the live query's
-		 * instrumentation.  At finalize InstrEndLoop (above) has already closed
-		 * the loop, so eof must not be counted a second time there.
-		 */
 		eff_nloops = instr->nloops;
 		if (!qs_walker_ctx->finalize && instr->eof)
 			eff_nloops += 1;
@@ -387,12 +374,6 @@ qs_get_node_stats(PlanState *planstate, QsWalkerContext *qs_walker_ctx)
 		 */
 		nodestat->eof = instr->eof;
 
-		/*
-		 * A node that hit eof has finished producing for this cycle even if
-		 * instr->running still reads true between fetches and InstrEndLoop has
-		 * not closed the loop yet -- treat it as done.  eff_nloops already folds
-		 * that pass in, so it drives the FINISHED test.
-		 */
 		if (instr->running && !instr->eof)
 			nodestat->node_status = QS_NODE_STATUS_EXECUTING;
 		else if (eff_nloops > 0)
@@ -400,13 +381,6 @@ qs_get_node_stats(PlanState *planstate, QsWalkerContext *qs_walker_ctx)
 		else
 			nodestat->node_status = QS_NODE_STATUS_INITIALIZED;
 
-		/*
-		 * Per-node spill, from the GP-specific Instrumentation fields. These are
-		 * populated by the node executors: workfileCreated live at spill for
-		 * Agg/HashJoin/Hash, at eager-free for Sort; workmemused/workmemwanted at
-		 * batch boundaries (Agg) or explain-end. A running snapshot is therefore a
-		 * lower bound — consumers treat it as such.
-		 */
 		nodestat->workfile_created = instr->workfileCreated;
 		nodestat->workmem_used     = (int64_t) instr->workmemused;
 		nodestat->workmem_wanted   = (int64_t) instr->workmemwanted;
@@ -689,29 +663,9 @@ SendQueryState(void)
 	{
 		qs_result = runtime_explain();
 		qs_debug_node_stats(qs_result);
-
 		gpsc_qs_sync_config();
-
-		/*
-		 * Emit the whole plan-tree snapshot as a single batch: one UDS
-		 * connection per backend instead of connect+send+close per node.  Key it
-		 * under this backend's own trace slot, stamped by the dispatcher before
-		 * the signal.  The slot is per-backend, so distinct backends never
-		 * collide; two overlapping collections of the *same* backend still share
-		 * one slot and can race, so the caller must not poll one pid twice
-		 * concurrently.
-		 */
 		emit_node_batch(qs_result, qs_trace_slots[MyBackendId]);
 
-		/*
-		 * Coordinator-only: push the full ExplainPrintPlan document so yagpcc
-		 * has the deparsed structure (expressions, costs, Settings) that the
-		 * compact per-node stats cannot reconstruct.  On a QE the plan subtree
-		 * may reach child PlanStates from other slices that are not
-		 * instantiated here, so restrict this to the QD.  Rate-limited to once
-		 * per PLAN_DOC_RESEND_INTERVAL_MS per query so repeated polls of a
-		 * long-running query do not resend the unchanging plan every time.
-		 */
 		if (Gp_role == GP_ROLE_DISPATCH)
 		{
 			bool	is_same_query;

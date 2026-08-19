@@ -94,7 +94,7 @@ bool pg_qs_buffers = true;
  * Rolling counter incremented for every QueryDesc pushed onto the stack.
  * Used to generate synthetic queryId values for statements lacking one.
  */
-static int qs_query_count = 0;
+static int qs_push_count = 0;
 
 /* Saved hook pointer for chaining shmem_startup callbacks. */
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
@@ -376,7 +376,7 @@ pg_qs_executor_start(QueryDesc *queryDesc, int eflags)
 
 	if (queryDesc->plannedstmt->queryId == 0)
 		queryDesc->plannedstmt->queryId =
-			((uint64) gp_command_count << 32) + qs_query_count;
+			((uint64) gp_command_count << 32) + qs_push_count;
 }
 
 /*
@@ -419,7 +419,7 @@ pg_qs_executor_end(QueryDesc *queryDesc)
 static void
 push_query(QueryDesc *queryDesc)
 {
-	qs_query_count++;
+	qs_push_count++;
 	QueryDescStack = lcons(queryDesc, QueryDescStack);
 }
 
@@ -429,7 +429,7 @@ push_query(QueryDesc *queryDesc)
 void
 pg_qs_push_query(QueryDesc *queryDesc)
 {
-	qs_query_count++;
+	qs_push_count++;
 	QueryDescStack = lcons(queryDesc, QueryDescStack);
 }
 
