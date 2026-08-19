@@ -1,0 +1,257 @@
+# --------------------------------------------------------------------
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed
+# with this work for additional information regarding copyright
+# ownership. The ASF licenses this file to You under the Apache
+# License, Version 2.0 (the "License"); you may not use this file
+# except in compliance with the License. You may obtain a copy of the
+# License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+# implied. See the License for the specific language governing
+# permissions and limitations under the License.
+#
+# --------------------------------------------------------------------
+# gp_stats_collector crash test
+#
+# Proves that with the runtime query-state feature fully enabled and a poller
+# tracing every running query, Cloudberry does not crash and queries still
+# finish with the same results as without tracing.
+#
+# One build, one demo cluster, up to three installcheck-world runs on it:
+#   run 1  baseline  (no poller)
+#   run 2  traced    (poller running)      + crash gate
+#   run 3  reconfirm (no poller)           only if run 2 added new failures
+#
+# Verdict: FAIL iff the crash gate tripped OR a test failed under tracing that
+# neither the baseline nor the no-poller reconfirm reproduced.
+#
+# Heavy (multiple installcheck-world runs): manual / nightly only.
+# --------------------------------------------------------------------
+name: GPSC Crash Test
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Nightly at 02:30 UTC.
+    - cron: '30 2 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  crash-test:
+    name: installcheck-world under tracing
+    runs-on: ubuntu-latest
+    container:
+      image: apache/incubator-cloudberry:cbdb-build-ubuntu22.04-latest
+      options: >-
+        --user root
+        -h cdw
+    env:
+      SRC_DIR: ${{ github.workspace }}/cloudberry
+      CRASH_DIR: ${{ github.workspace }}/cloudberry/gpcontrib/gp_stats_collector/test/crash
+      UDS_PATH: /tmp/gpsc_agent.sock
+      STOP_FILE: /tmp/gpsc_poller.stop
+
+    steps:
+      - name: Checkout Cloudberry source
+        uses: actions/checkout@v4
+        with:
+          path: cloudberry
+          submodules: recursive
+
+      - name: Cloudberry Environment Initialization
+        shell: bash
+        run: |
+          set -eo pipefail
+          if ! su - gpadmin -c "/tmp/init_system.sh"; then
+            echo "::error::Container initialization failed"
+            exit 1
+          fi
+          mkdir -p "${SRC_DIR}/build-logs"
+          chown -R gpadmin:gpadmin .
+          chmod -R 755 .
+
+      - name: Configure
+        shell: bash
+        run: |
+          set -eo pipefail
+          chmod +x "${SRC_DIR}"/devops/build/automation/cloudberry/scripts/configure-cloudberry.sh
+          if ! time su - gpadmin -c "cd ${SRC_DIR} && SRC_DIR=${SRC_DIR} ${SRC_DIR}/devops/build/automation/cloudberry/scripts/configure-cloudberry.sh"; then
+            echo "::error::Configure failed"
+            exit 1
+          fi
+
+      - name: Build
+        shell: bash
+        run: |
+          set -eo pipefail
+          chmod +x "${SRC_DIR}"/devops/build/automation/cloudberry/scripts/build-cloudberry.sh
+          if ! time su - gpadmin -c "cd ${SRC_DIR} && SRC_DIR=${SRC_DIR} ${SRC_DIR}/devops/build/automation/cloudberry/scripts/build-cloudberry.sh"; then
+            echo "::error::Build failed"
+            exit 1
+          fi
+
+      - name: Build isolation2 harness
+        shell: bash
+        run: |
+          set -eo pipefail
+          if ! time su - gpadmin -c "cd ${SRC_DIR} && \
+            source /usr/local/cloudberry-db/cloudberry-env.sh && \
+            make -C src/test/isolation2 install"; then
+            echo "::error::isolation2 harness build failed"
+            exit 1
+          fi
+
+      - name: Create demo cluster with full gp_stats_collector config
+        shell: bash
+        run: |
+          set -eo pipefail
+          chmod +x "${SRC_DIR}"/devops/build/automation/cloudberry/scripts/create-cloudberry-demo-cluster.sh
+          if ! time su - gpadmin -c "cd ${SRC_DIR} && SRC_DIR=${SRC_DIR} ${SRC_DIR}/devops/build/automation/cloudberry/scripts/create-cloudberry-demo-cluster.sh"; then
+            echo "::error::Demo cluster creation failed"
+            exit 1
+          fi
+          # Phase 1: load the module, then restart so its custom GUCs are known.
+          su - gpadmin -c "cd ${SRC_DIR} && \
+            source /usr/local/cloudberry-db/cloudberry-env.sh && \
+            source gpAux/gpdemo/gpdemo-env.sh && \
+            gpconfig -c shared_preload_libraries -v 'gp_stats_collector' && \
+            gpstop -ra"
+          # Phase 2: enable every logging/polling knob, then restart again.
+          su - gpadmin -c "cd ${SRC_DIR} && \
+            source /usr/local/cloudberry-db/cloudberry-env.sh && \
+            source gpAux/gpdemo/gpdemo-env.sh && \
+            gpconfig -c pg_query_state.enable -v on && \
+            gpconfig -c pg_query_state.enable_timing -v on && \
+            gpconfig -c pg_query_state.enable_buffers -v on && \
+            gpconfig -c gpsc.enable -v on && \
+            gpconfig -c gpsc.enable_analyze -v on && \
+            gpconfig -c gpsc.enable_cdbstats -v on && \
+            gpconfig -c gpsc.report_nested_queries -v on && \
+            gpconfig -c gpsc.logging_mode -v UDS && \
+            gpconfig -c gpsc.uds_path -v ${UDS_PATH} && \
+            gpstop -ra"
+
+      - name: Start UDS drain
+        shell: bash
+        run: |
+          set -eo pipefail
+          chown -R gpadmin:gpadmin "${CRASH_DIR}"
+          su - gpadmin -c "nohup python3 ${CRASH_DIR}/uds_drain.py --path ${UDS_PATH} \
+            > ${SRC_DIR}/build-logs/uds-drain.log 2>&1 &"
+          sleep 2
+          test -S "${UDS_PATH}" || { echo "::error::UDS drain socket not created"; exit 1; }
+
+      - name: 'Run 1: baseline installcheck-world (no poller)'
+        shell: bash
+        run: |
+          set -eo pipefail
+          su - gpadmin -c "cd ${SRC_DIR} && \
+            source /usr/local/cloudberry-db/cloudberry-env.sh && \
+            source gpAux/gpdemo/gpdemo-env.sh && \
+            make installcheck-world > ${SRC_DIR}/build-logs/run1-baseline.log 2>&1" || true
+          bash "${CRASH_DIR}/extract_failures.sh" "${SRC_DIR}/build-logs/run1-baseline.log" \
+            > "${SRC_DIR}/build-logs/baseline-failures.txt"
+          echo "baseline failures: $(wc -l < ${SRC_DIR}/build-logs/baseline-failures.txt)"
+          cat "${SRC_DIR}/build-logs/baseline-failures.txt" || true
+
+      - name: 'Run 2: traced installcheck-world (poller running)'
+        shell: bash
+        run: |
+          set -eo pipefail
+          rm -f "${STOP_FILE}"
+          su - gpadmin -c "cd ${SRC_DIR} && \
+            source /usr/local/cloudberry-db/cloudberry-env.sh && \
+            source gpAux/gpdemo/gpdemo-env.sh && \
+            nohup python3 ${CRASH_DIR}/poller.py --stop-file ${STOP_FILE} \
+              > ${SRC_DIR}/build-logs/poller.log 2>&1 &"
+          su - gpadmin -c "cd ${SRC_DIR} && \
+            source /usr/local/cloudberry-db/cloudberry-env.sh && \
+            source gpAux/gpdemo/gpdemo-env.sh && \
+            make installcheck-world > ${SRC_DIR}/build-logs/run2-traced.log 2>&1" || true
+          touch "${STOP_FILE}"
+          sleep 3
+          bash "${CRASH_DIR}/extract_failures.sh" "${SRC_DIR}/build-logs/run2-traced.log" \
+            > "${SRC_DIR}/build-logs/traced-failures.txt"
+          echo "traced failures: $(wc -l < ${SRC_DIR}/build-logs/traced-failures.txt)"
+          cat "${SRC_DIR}/build-logs/traced-failures.txt" || true
+
+      - name: 'Crash gate'
+        shell: bash
+        run: |
+          set -eo pipefail
+          if ! su - gpadmin -c "cd ${SRC_DIR} && \
+            source /usr/local/cloudberry-db/cloudberry-env.sh && \
+            source gpAux/gpdemo/gpdemo-env.sh && \
+            bash ${CRASH_DIR}/crash_scan.sh ${SRC_DIR}/gpAux/gpdemo/datadirs \
+              > ${SRC_DIR}/build-logs/crash-scan.log 2>&1"; then
+            echo "::error::Crash gate tripped -- Cloudberry did not survive tracing"
+            cat "${SRC_DIR}/build-logs/crash-scan.log"
+            exit 1
+          fi
+          cat "${SRC_DIR}/build-logs/crash-scan.log"
+
+      - name: 'Run 3: reconfirm new failures (no poller)'
+        shell: bash
+        run: |
+          set -eo pipefail
+          new=$(comm -13 \
+            "${SRC_DIR}/build-logs/baseline-failures.txt" \
+            "${SRC_DIR}/build-logs/traced-failures.txt")
+          printf '%s\n' "${new}" | sed '/^$/d' > "${SRC_DIR}/build-logs/new-failures.txt"
+          count=$(sed '/^$/d' "${SRC_DIR}/build-logs/new-failures.txt" | wc -l)
+          echo "new failures under tracing: ${count}"
+          cat "${SRC_DIR}/build-logs/new-failures.txt" || true
+          if [ "${count}" -eq 0 ]; then
+            echo "No tracing-only failures; skipping reconfirm."
+            : > "${SRC_DIR}/build-logs/reconfirmed-failures.txt"
+            exit 0
+          fi
+          # Reproduce without the poller: anything that fails here too is a flake.
+          su - gpadmin -c "cd ${SRC_DIR} && \
+            source /usr/local/cloudberry-db/cloudberry-env.sh && \
+            source gpAux/gpdemo/gpdemo-env.sh && \
+            make installcheck-world > ${SRC_DIR}/build-logs/run3-reconfirm.log 2>&1" || true
+          bash "${CRASH_DIR}/extract_failures.sh" "${SRC_DIR}/build-logs/run3-reconfirm.log" \
+            > "${SRC_DIR}/build-logs/reconfirm-failures.txt"
+          # Genuine regressions: new failures that did NOT reappear without the poller.
+          comm -23 \
+            "${SRC_DIR}/build-logs/new-failures.txt" \
+            <(sort -u "${SRC_DIR}/build-logs/reconfirm-failures.txt") \
+            > "${SRC_DIR}/build-logs/regressions.txt"
+          echo "genuine regressions (failed only under tracing): $(sed '/^$/d' ${SRC_DIR}/build-logs/regressions.txt | wc -l)"
+          cat "${SRC_DIR}/build-logs/regressions.txt" || true
+
+      - name: 'Verdict'
+        shell: bash
+        run: |
+          set -eo pipefail
+          reg="${SRC_DIR}/build-logs/regressions.txt"
+          if [ -s "${reg}" ]; then
+            echo "::error::Tracing introduced test failures not seen without it:"
+            cat "${reg}"
+            exit 1
+          fi
+          echo "PASS: no crash, and no tracing-only regressions."
+
+      - name: Upload crash-test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpsc-crash-test-results
+          path: |
+            cloudberry/build-logs/
+            cloudberry/src/test/regress/regression.diffs
+            cloudberry/src/test/isolation2/regression.diffs
+          retention-days: 14
