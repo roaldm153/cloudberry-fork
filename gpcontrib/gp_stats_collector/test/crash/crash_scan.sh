@@ -34,9 +34,14 @@ set -uo pipefail
 log_root="${1:?usage: crash_scan.sh <log-root>}"
 status=0
 
-# Crash markers only -- plain FATAL is routine during regression (missing role,
-# duplicate object, etc.), so it is intentionally excluded.
-patterns='PANIC|terminating connection because of crash of another server process|the database system is in recovery mode|server closed the connection unexpectedly|was terminated by signal|startup process .* was terminated'
+# Unambiguous crash markers only.  Excluded on purpose:
+#   - plain FATAL: routine during regression (missing role, duplicate object).
+#   - "server closed the connection unexpectedly" / "the database system is in
+#     recovery mode": routine mirror/walreceiver churn on every restart
+#     (gpstop -ar), not a crash.
+# Real crashes are caught here (PANIC, postmaster-wide crash restart, a process
+# killed by a signal) and corroborated by gpstate -e + SELECT 1 below.
+patterns='PANIC|terminating connection because of crash of another server process|was terminated by signal [0-9]'
 
 echo "== crash_scan: log markers under ${log_root} =="
 if hits=$(grep -rERn "${patterns}" "${log_root}" 2>/dev/null); then

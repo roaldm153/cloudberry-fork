@@ -165,7 +165,7 @@ jobs:
           su - gpadmin -c "cd ${SRC_DIR} && \
             source /usr/local/cloudberry-db/cloudberry-env.sh && \
             source gpAux/gpdemo/gpdemo-env.sh && \
-            make installcheck-world > ${SRC_DIR}/build-logs/run1-baseline.log 2>&1" || true
+            make -k installcheck-world > ${SRC_DIR}/build-logs/run1-baseline.log 2>&1" || true
           bash "${CRASH_DIR}/extract_failures.sh" "${SRC_DIR}/build-logs/run1-baseline.log" \
             > "${SRC_DIR}/build-logs/baseline-failures.txt"
           echo "baseline failures: $(wc -l < ${SRC_DIR}/build-logs/baseline-failures.txt)"
@@ -184,7 +184,7 @@ jobs:
           su - gpadmin -c "cd ${SRC_DIR} && \
             source /usr/local/cloudberry-db/cloudberry-env.sh && \
             source gpAux/gpdemo/gpdemo-env.sh && \
-            make installcheck-world > ${SRC_DIR}/build-logs/run2-traced.log 2>&1" || true
+            make -k installcheck-world > ${SRC_DIR}/build-logs/run2-traced.log 2>&1" || true
           touch "${STOP_FILE}"
           sleep 3
           bash "${CRASH_DIR}/extract_failures.sh" "${SRC_DIR}/build-logs/run2-traced.log" \
@@ -227,7 +227,7 @@ jobs:
           su - gpadmin -c "cd ${SRC_DIR} && \
             source /usr/local/cloudberry-db/cloudberry-env.sh && \
             source gpAux/gpdemo/gpdemo-env.sh && \
-            make installcheck-world > ${SRC_DIR}/build-logs/run3-reconfirm.log 2>&1" || true
+            make -k installcheck-world > ${SRC_DIR}/build-logs/run3-reconfirm.log 2>&1" || true
           bash "${CRASH_DIR}/extract_failures.sh" "${SRC_DIR}/build-logs/run3-reconfirm.log" \
             > "${SRC_DIR}/build-logs/reconfirm-failures.txt"
           # Genuine regressions: new failures that did NOT reappear without the poller.
