@@ -36,6 +36,9 @@
 name: GPSC Crash Test
 
 on:
+  push:
+    branches:
+      - pgqs-proto-uds-sandbox
   workflow_dispatch:
   schedule:
     # Nightly at 02:30 UTC.
