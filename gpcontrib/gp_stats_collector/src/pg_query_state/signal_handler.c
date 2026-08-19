@@ -20,7 +20,7 @@
  * signal_handler.c
  *		Custom signal handlers and plan-tree walker for pg_query_state.
  *
- * This module implements the three custom ProcSignal handlers registered by
+ * This module implements the two custom ProcSignal handlers registered by
  * pg_qs_init():
  *
  *   SendQueryState()    -- fired when QueryStatePollReason is received.
@@ -177,7 +177,7 @@ shm_mq_send_nonblocking(shm_mq_handle *mqh, Size nbytes,
  *
  * Returns MSG_BY_PARTS_SUCCEEDED on success, MSG_BY_PARTS_FAILED otherwise.
  */
-msg_by_parts_result
+static msg_by_parts_result
 send_msg_by_parts(shm_mq_handle *mqh, Size nbytes, const void *data)
 {
 	int offset;
@@ -217,7 +217,7 @@ send_msg_by_parts(shm_mq_handle *mqh, Size nbytes, const void *data)
  *   qs_walker_ctx -- context threaded through all callbacks
  *   depth         -- current recursion depth (for stack-depth checks)
  */
-void
+static void
 qs_planstate_walker(PlanState *planstate,
 					qs_planstate_walker_callback executor,
 					QsWalkerContext *qs_walker_ctx,
@@ -320,7 +320,7 @@ qs_planstate_walker(PlanState *planstate,
  *   planstate      -- the plan node being sampled
  *   qs_walker_ctx  -- walker context; per_node_stats is extended in-place
  */
-void
+static void
 qs_get_node_stats(PlanState *planstate, QsWalkerContext *qs_walker_ctx)
 {
 	GpscNodeSample *nodestat =
@@ -481,7 +481,7 @@ qs_get_node_stats(PlanState *planstate, QsWalkerContext *qs_walker_ctx)
  * Intended for development and integration testing.  In production deployments
  * this will produce a large number of log lines; suppress with log_min_messages.
  */
-void
+static void
 qs_debug_node_sample(GpscNodeSample *s)
 {
 	elog(DEBUG1,
@@ -511,7 +511,7 @@ qs_debug_node_sample(GpscNodeSample *s)
  *
  * Logs a summary line followed by one line per node via qs_debug_node_sample().
  */
-void
+static void
 qs_debug_node_stats(List *per_node_stats)
 {
 	ListCell *lc;
@@ -559,7 +559,7 @@ runtime_explain(void)
  *
  * The caller is responsible for calling gpsc_qs_sync_config() beforehand.
  */
-void
+static void
 emit_node_batch(List *per_node_stats, const char *trace_id)
 {
 	GpscNodeSample **arr;
@@ -742,6 +742,8 @@ fill_segpid(CdbComponentDatabaseInfo *segInfo, backend_info *msg, int *index)
 void
 SendCdbComponents(void)
 {
+	Assert(Gp_role == GP_ROLE_DISPATCH && "QD only function");
+
 	shm_mq_handle         *mqh = NULL;
 	CdbComponentDatabases *cdbs;
 	msg_by_parts_result   send_result;

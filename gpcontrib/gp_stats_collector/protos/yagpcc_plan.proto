@@ -20,6 +20,8 @@ syntax = "proto3";
 
 import "google/protobuf/timestamp.proto";
 
+import "protos/yagpcc_metrics.proto";
+
 package yagpcc;
 
 message SetQueryPlanReq {
@@ -62,18 +64,4 @@ message PlanNode {
     int32  slice_id             = 4;
     double plan_rows            = 5;
     int32  relation_oid         = 6;
-}
-
-/*
- * Common query and segment identification keys reused across messages.
- */
-message QueryKey {
-    int32 tmid = 1;   /* gp_gettmid() transaction/time identifier */
-    int32 ssid = 2;   /* gp_session_id */
-    int32 ccnt = 3;   /* gp_command_count */
-}
-
-message SegmentKey {
-    int32 dbid     = 1;   /* GpIdentity.dbid */
-    int32 segindex = 2;   /* GpIdentity.segindex (-1 = coordinator) */
 }

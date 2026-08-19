@@ -20,6 +20,7 @@ syntax = "proto3";
 
 import "google/protobuf/timestamp.proto";
 
+import "protos/yagpcc_metrics.proto";
 import "protos/yagpcc_plan.proto";
 
 package yagpcc;
@@ -36,6 +37,11 @@ package yagpcc;
  * extended protocol header (payload_size | 0x80000000, request_type=1,
  * reserved=0).
  *
+ * trace_id keys the whole collection: 16 raw bytes minted once on the
+ * coordinator per pg_query_state() call and stamped into every backend's batch,
+ * so yagpcc can group the snapshots of one poll and tell them apart from an
+ * overlapping poll of the same pid.
+ *
  * This message MUST stay byte-identical to the yagpcc-side definition in
  * api/proto/agent_segment/yagpcc_set_service.proto.
  */
@@ -43,7 +49,7 @@ message SetPerNodeBatchReq {
     google.protobuf.Timestamp datetime    = 1;
     SegmentKey                segment_key = 2;
     repeated BatchNode        nodes       = 3;
-    bytes                     trace_id    = 4;
+    bytes                     trace_id    = 4;   /* 16-byte per-collection key (see above) */
 }
 
 /*

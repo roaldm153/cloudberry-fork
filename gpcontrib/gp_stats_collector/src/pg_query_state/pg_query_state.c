@@ -148,14 +148,16 @@ ProcSignalReason BackendInfoPollReason = INVALID_PROCSIGNAL;
 static Size pg_qs_shmem_size(void);
 static void pg_qs_shmem_startup(void);
 static void push_query(QueryDesc *queryDesc);
-
+static bool filter_query(QueryDesc *queryDesc);
+static shm_mq_result shm_mq_receive_with_timeout(shm_mq_handle *mqh, Size *nbytesp,
+												 void **datap, int64 timeout);
 static List *get_query_backend_info(ArrayType *array);
-
 static shm_mq_result receive_msg_by_parts(shm_mq_handle *mqh, Size *total,
 										  void **datap, int64 timeout,
 										  int *rc, bool nowait);
 static PG_QS_RequestResult GetRemoteBackendInfo(PGPROC *proc, List **result);
 static void CollectQEQueryState(List *backendInfo, bytea *trace_id);
+static bool is_querystack_empty(void);
 
 #if PG_VERSION_NUM >= 150000
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
@@ -424,17 +426,10 @@ push_query(QueryDesc *queryDesc)
 }
 
 /*
- * pg_qs_push_query -- public alias for push_query, called from hook_wrappers.
- */
-void
-pg_qs_push_query(QueryDesc *queryDesc)
-{
-	qs_push_count++;
-	QueryDescStack = lcons(queryDesc, QueryDescStack);
-}
-
-/*
  * pg_qs_pop_query -- remove the most-recently-pushed QueryDesc from the stack.
+ *
+ * Non-static: the ExecutorRun/Finish wrappers in hook_wrappers.cpp call it to
+ * balance the push done by pg_qs_executor_run/finish.
  */
 void
 pg_qs_pop_query(void)
@@ -442,7 +437,7 @@ pg_qs_pop_query(void)
 	QueryDescStack = list_delete_first(QueryDescStack);
 }
 
-bool
+static bool
 is_querystack_empty(void)
 {
 	return list_length(QueryDescStack) == 0;
@@ -460,7 +455,7 @@ get_toppest_query(void)
  * Returns false for cursor queries with non-default cursor options, and for
  * utility statements.  Returns true for SELECT, INSERT, UPDATE, DELETE.
  */
-bool
+static bool
 filter_query(QueryDesc *queryDesc)
 {
 	Portal portal;
@@ -482,47 +477,12 @@ filter_query(QueryDesc *queryDesc)
 }
 
 /*
- * wait_for_mq_detached -- spin until the caller has attached to the mq or
- * MAX_SND_TIMEOUT milliseconds elapses.
- *
- * Returns true if the queue was detached within the timeout (i.e. the other
- * end is done), false on timeout.
- */
-bool
-wait_for_mq_detached(shm_mq_handle *mqh)
-{
-	instr_time start_time;
-	instr_time cur_time;
-	int64 delay = MAX_SND_TIMEOUT;
-
-	INSTR_TIME_SET_CURRENT(start_time);
-	for (;;)
-	{
-		if (shm_mq_wait_for_attach(mqh) == SHM_MQ_DETACHED)
-			break;
-		WaitLatch(MyLatch,
-				  WL_LATCH_SET | WL_EXIT_ON_PM_DEATH | WL_TIMEOUT,
-				  delay, PG_WAIT_IPC);
-		INSTR_TIME_SET_CURRENT(cur_time);
-		INSTR_TIME_SUBTRACT(cur_time, start_time);
-		delay = MAX_SND_TIMEOUT - (int64) INSTR_TIME_GET_MILLISEC(cur_time);
-		if (delay <= 0)
-		{
-			elog(WARNING, "pg_query_state: wait_for_mq_detached timed out");
-			return false;
-		}
-		CHECK_FOR_INTERRUPTS();
-	}
-	return true;
-}
-
-/*
  * LockShmem -- acquire an exclusive user-lock keyed by (PG_QS_MODULE_KEY, key).
  *
  * Used to serialise access to the shared mq between concurrent requestors
  * and between requestor and handler.
  */
-void
+static void
 LockShmem(LOCKTAG *tag, uint32 key)
 {
 	LockAcquireResult result;
@@ -541,7 +501,7 @@ LockShmem(LOCKTAG *tag, uint32 key)
 /*
  * UnlockShmem -- release the exclusive user-lock acquired by LockShmem.
  */
-void
+static void
 UnlockShmem(LOCKTAG *tag)
 {
 	LockRelease(tag, ExclusiveLock, false);
@@ -673,7 +633,7 @@ CollectQEQueryState(List *backendInfo, bytea *trace_id)
  * On success, *nbytesp is set to the message length and *datap to a palloc'd
  * buffer containing the message.
  */
-shm_mq_result
+static shm_mq_result
 shm_mq_receive_with_timeout(shm_mq_handle *mqh,
 							Size *nbytesp,
 							void **datap,

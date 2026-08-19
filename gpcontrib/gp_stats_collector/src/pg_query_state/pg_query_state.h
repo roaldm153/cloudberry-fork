@@ -220,53 +220,15 @@ extern void pg_qs_executor_run(QueryDesc *queryDesc);
 extern void pg_qs_executor_finish(QueryDesc *queryDesc);
 extern void pg_qs_executor_end(QueryDesc *queryDesc);
 
-/* Shared-memory queue receive helper with millisecond deadline. */
-extern shm_mq_result shm_mq_receive_with_timeout(shm_mq_handle *mqh,
-												  Size *nbytesp,
-												  void **datap,
-												  int64 timeout);
-
-/* QueryDescStack push/pop helpers. */
+/* Pops the QueryDesc pushed by executor_run/finish; called from hook_wrappers.cpp. */
 extern void pg_qs_pop_query(void);
-extern void pg_qs_push_query(QueryDesc *);
 
 /* Custom signal handlers registered with RegisterCustomProcSignalHandler. */
 extern void SendQueryState(void);
 extern void SendCdbComponents(void);
 
-/* Shared-memory lock helpers. */
-extern void UnlockShmem(LOCKTAG *tag);
-extern void LockShmem(LOCKTAG *tag, uint32 key);
-
-/* Chunked shm_mq send. */
-extern msg_by_parts_result send_msg_by_parts(shm_mq_handle *mqh,
-											 Size nbytes,
-											 const void *data);
-
-/* Plan-tree walker and per-node stat collectors. */
 typedef void (*qs_planstate_walker_callback)(PlanState *, QsWalkerContext *);
-extern void qs_planstate_walker(PlanState *, qs_planstate_walker_callback,
-								QsWalkerContext *, int depth);
-extern void qs_get_node_stats(PlanState *, QsWalkerContext *);
-
-/* Debug logging helpers -- emit collected stats to PostgreSQL LOG. */
-extern void qs_debug_node_stats(List *per_node_stats);
-extern void qs_debug_node_sample(GpscNodeSample *sample);
-
-/*
- * emit_node_batch -- flatten a List<GpscNodeSample *> into an array and push
- * it to the yagpcc UDS sink as a single SetPerNodeBatchReq (one connection
- * per backend).  No-op on an empty list.  The caller must have invoked
- * gpsc_qs_sync_config() first.
- */
-extern void emit_node_batch(List *per_node_stats, const char *trace_id);
-
-/* Query filtering and miscellaneous helpers. */
-extern bool filter_query(QueryDesc *queryDesc);
-extern bool wait_for_mq_detached(shm_mq_handle *mqh);
-extern bool is_querystack_empty(void);
 extern QueryDesc *get_toppest_query(void);
-
 extern void gpsc_reset_node_roll_state(void);
 
 #ifdef __cplusplus
