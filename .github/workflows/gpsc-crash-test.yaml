@@ -117,6 +117,22 @@ jobs:
             exit 1
           fi
 
+      - name: Match baseline EXPLAIN to the traced pass
+        shell: bash
+        run: |
+          set -eo pipefail
+          # The loaded extension turns on query-id computation, so EXPLAIN VERBOSE
+          # under tracing prints an extra "Query Identifier:" line that the stock
+          # baseline omits -- which would show up as dozens of tracing-only diffs
+          # that are pure cosmetics.  Turn query-id on for the baseline too, so
+          # both passes fail those tests identically and they cancel out of the
+          # delta, leaving only genuinely tracing-specific failures.
+          su - gpadmin -c "cd ${SRC_DIR} && \
+            source /usr/local/cloudberry-db/cloudberry-env.sh && \
+            source gpAux/gpdemo/gpdemo-env.sh && \
+            gpconfig -c compute_query_id -v on && \
+            gpstop -u"
+
       - name: 'Run 1: baseline installcheck-parallel (feature OFF)'
         shell: bash
         run: |
@@ -131,6 +147,23 @@ jobs:
             > "${SRC_DIR}/build-logs/baseline-failures.txt"
           echo "baseline failures: $(wc -l < ${SRC_DIR}/build-logs/baseline-failures.txt)"
           cat "${SRC_DIR}/build-logs/baseline-failures.txt"
+
+      - name: Reset state leaked by the baseline pass
+        shell: bash
+        run: |
+          set -eo pipefail
+          # installcheck recreates the 'regression' database each pass, but
+          # CREATE ROLE makes cluster-global roles that outlive it -- run 2's
+          # test_setup would then fail "role already exists".  Drop the baseline
+          # database (clears role grants/ownership on it) and every regression-
+          # created role, so run 2 starts from the same clean slate as run 1.
+          su - gpadmin -c "cd ${SRC_DIR} && \
+            source /usr/local/cloudberry-db/cloudberry-env.sh && \
+            source gpAux/gpdemo/gpdemo-env.sh && \
+            psql -X -d postgres -c 'DROP DATABASE IF EXISTS regression;' && \
+            psql -X -q -A -t -d postgres \
+              -c \"SELECT format('DROP ROLE IF EXISTS %I;', rolname) FROM pg_roles WHERE rolname ~ '^(regress|mdb)'\" \
+            | psql -X -d postgres -f -"
 
       - name: Enable full gp_stats_collector config
         shell: bash
