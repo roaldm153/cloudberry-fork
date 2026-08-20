@@ -173,7 +173,7 @@ jobs:
             gpconfig -c gpsc.report_nested_queries -v on && \
             gpconfig -c gpsc.logging_mode -v UDS && \
             gpconfig -c gpsc.uds_path -v ${UDS_PATH} && \
-            gpconfig -c compute_query_id -v off && \
+            gpconfig -c compute_query_id -v regress && \
             gpstop -ar && \
             sleep 10"
 
