@@ -54,6 +54,7 @@
 #include "pg_query_state.h"
 #include "PlanNodeEmitter.h"
 
+#include "access/xact.h"
 #include "cdb/cdbexplain.h"
 #include "cdb/cdbutil.h"
 #include "cdb/cdbvars.h"
@@ -70,6 +71,7 @@
 #include "storage/lock.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
+#include "utils/resowner.h"
 #include "utils/rel.h"
 #include "utils/timestamp.h"
 #include "utils/hsearch.h"
@@ -95,6 +97,8 @@ typedef struct NodeRollState
 	double prev_ntuples_sum;
 	TimestampTz prev_executed_at;
 	TimestampTz first_executed_at;
+	int32_t relation_oid;
+	char relation_name[MAX_RELNAME_LEN];
 } NodeRollState;
 
 static HTAB *node_roll_htab = NULL;
@@ -328,7 +332,7 @@ qs_get_node_stats(PlanState *planstate, QsWalkerContext *qs_walker_ctx)
 
 	/* Identity fields. */
 	nodestat->ssid = gp_session_id;
-	gp_gettmid(&nodestat->tmid);
+	nodestat->tmid = qs_walker_ctx->tmid;
 	nodestat->ccnt = gp_command_count;
 
 	/* Plan-tree position. */
@@ -390,52 +394,6 @@ qs_get_node_stats(PlanState *planstate, QsWalkerContext *qs_walker_ctx)
 		nodestat->node_status = QS_NODE_STATUS_INITIALIZED;
 	}
 
-	Index rti = 0;
-	switch (nodeTag(planstate->plan))
-    {
-		case T_SeqScan:
-		case T_DynamicSeqScan:
-		case T_SampleScan:
-		case T_IndexScan:
-		case T_DynamicIndexScan:
-		case T_DynamicIndexOnlyScan:
-		case T_IndexOnlyScan:
-		case T_BitmapHeapScan:
-		case T_DynamicBitmapHeapScan:
-		case T_TidScan:
-		case T_TidRangeScan:
-		case T_ForeignScan:
-		case T_DynamicForeignScan:
-		case T_CustomScan:
-				rti = ((Scan *) planstate->plan)->scanrelid;
-				break;
-		case T_ModifyTable:
-				rti = ((ModifyTable *) planstate->plan)->nominalRelation;
-				break;
-		default:
-				break;
-    }
-
-	if (rti > 0 && planstate->state) 
-	{
-		List *rtable = planstate->state->es_range_table;
-		char *relname = NULL;
-		if (rti <= (Index) list_length(rtable))
-		{
-			RangeTblEntry *rte = rt_fetch(rti, rtable);
-			if (rte->rtekind == RTE_RELATION)
-			{
-				nodestat->relation_oid = (int32_t)rte->relid;
-				relname = get_rel_name(rte->relid);
-				if (relname)
-				{
-					strlcpy(nodestat->relation_name, relname, MAX_RELNAME_LEN);
-					pfree(relname);
-				}
-			}
-		}
-	}
-
 	qs_walker_ctx->per_node_stats =
 		lappend(qs_walker_ctx->per_node_stats, nodestat);
 
@@ -444,11 +402,6 @@ qs_get_node_stats(PlanState *planstate, QsWalkerContext *qs_walker_ctx)
 		double cur_sum = nodestat->ntuples;
 		bool found;
 		NodeRollState *rs;
-
-		if (!node_roll_htab)
-		{
-			ensure_node_roll_htab();
-		}
 
 		rs = (NodeRollState *) hash_search(node_roll_htab,
 			&nodestat->plan_node_id, HASH_ENTER, &found);
@@ -459,14 +412,70 @@ qs_get_node_stats(PlanState *planstate, QsWalkerContext *qs_walker_ctx)
 			nodestat->ntuples_delta = cur_sum - rs->prev_ntuples_sum;
 			nodestat->tuples_per_sec = (dt > 0) ? nodestat->ntuples_delta / dt : 0;
 			nodestat->time_since_init_sec = (double) (ts_now - rs->first_executed_at) / USECS_PER_SEC;
+
+			/* Relation identity is invariant per plan node: reuse the cache. */
+			nodestat->relation_oid = rs->relation_oid;
+			strlcpy(nodestat->relation_name, rs->relation_name, MAX_RELNAME_LEN);
 		}
 		else
 		{
+			Index rti = 0;
+
 			nodestat->ntuples_delta = cur_sum;
 			nodestat->tuples_per_sec = 0;
 			nodestat->time_since_init_sec = 0;
 			rs->first_executed_at = ts_now;
+
+			switch (nodeTag(planstate->plan))
+			{
+				case T_SeqScan:
+				case T_DynamicSeqScan:
+				case T_SampleScan:
+				case T_IndexScan:
+				case T_DynamicIndexScan:
+				case T_DynamicIndexOnlyScan:
+				case T_IndexOnlyScan:
+				case T_BitmapHeapScan:
+				case T_DynamicBitmapHeapScan:
+				case T_TidScan:
+				case T_TidRangeScan:
+				case T_ForeignScan:
+				case T_DynamicForeignScan:
+				case T_CustomScan:
+					rti = ((Scan *) planstate->plan)->scanrelid;
+					break;
+				case T_ModifyTable:
+					rti = ((ModifyTable *) planstate->plan)->nominalRelation;
+					break;
+				default:
+					break;
+			}
+
+			if (rti > 0 && planstate->state)
+			{
+				List *rtable = planstate->state->es_range_table;
+				if (rti <= (Index) list_length(rtable))
+				{
+					RangeTblEntry *rte = rt_fetch(rti, rtable);
+					if (rte->rtekind == RTE_RELATION)
+					{
+						char *relname;
+						nodestat->relation_oid = (int32_t) rte->relid;
+						relname = get_rel_name(rte->relid);
+						if (relname)
+						{
+							strlcpy(nodestat->relation_name, relname, MAX_RELNAME_LEN);
+							pfree(relname);
+						}
+					}
+				}
+			}
+
+			/* Cache the resolved identity for subsequent polls. */
+			rs->relation_oid = nodestat->relation_oid;
+			strlcpy(rs->relation_name, nodestat->relation_name, MAX_RELNAME_LEN);
 		}
+
 		nodestat->stalled = (nodestat->ntuples_delta == 0
 				&& nodestat->node_status == QS_NODE_STATUS_EXECUTING
 				&& !nodestat->eof);
@@ -517,6 +526,9 @@ qs_debug_node_stats(List *per_node_stats)
 	ListCell *lc;
 	int       i = 0;
 
+	if (!message_level_is_interesting(DEBUG1))
+		return;
+
 	elog(DEBUG1, "GpscNodeSample list: %d nodes", list_length(per_node_stats));
 	foreach(lc, per_node_stats)
 	{
@@ -536,7 +548,7 @@ qs_debug_node_stats(List *per_node_stats)
  * Callers must ensure QueryDescStack is non-empty before calling this.
  */
 static List *
-runtime_explain(void)
+runtime_explain(TimestampTz ts_now)
 {
 	QsWalkerContext *qs_walker_ctx =
 		(QsWalkerContext *) palloc0(sizeof(QsWalkerContext));
@@ -544,7 +556,9 @@ runtime_explain(void)
 
 	Assert(list_length(QueryDescStack) > 0);
 	queryDesc = get_toppest_query();
-	qs_walker_ctx->ts_now = GetCurrentTimestamp();
+	qs_walker_ctx->ts_now = ts_now;
+	gp_gettmid(&qs_walker_ctx->tmid);
+	ensure_node_roll_htab();
 	qs_planstate_walker(queryDesc->planstate, qs_get_node_stats,
 						qs_walker_ctx, 0);
 	return qs_walker_ctx->per_node_stats;
@@ -638,35 +652,61 @@ build_plan_doc(QueryDesc *queryDesc, ExplainFormat format)
 void
 SendQueryState(void)
 {
-	MemoryContext oldcontext;
-	MemoryContext qs_context;
-	List         *qs_result = NIL;
+	int                     saved_errno = errno;
+	MemoryContext  volatile oldcontext = CurrentMemoryContext;
+	MemoryContext  volatile qs_context = NULL;
+	QueryDesc              *qd;
 
 	if (!pg_qs_enable)
-		return;   /* STAT_DISABLED */
+	{
+		errno = saved_errno;
+		return;
+	}
 
 	if (!list_length(QueryDescStack))
-		return;   /* QUERY_NOT_RUNNING */
+	{
+		errno = saved_errno;
+		return;
+	}
+
+	if (MyBackendId < 1 || MyBackendId > MaxBackends)
+	{
+		errno = saved_errno;
+		return;
+	}
 
 	if (stack_is_too_deep())
 	{
 		elog(DEBUG1, "pg_query_state: skipping poll, call stack too deep");
+		errno = saved_errno;
 		return;
 	}
 
-	qs_context = AllocSetContextCreate(TopMemoryContext,
-									   "pg_query_state signal context",
-									   ALLOCSET_DEFAULT_SIZES);
-	oldcontext = MemoryContextSwitchTo(qs_context);
+	qd = get_toppest_query();
+	if (qd == NULL || qd->planstate == NULL || qd->estate == NULL)
+	{
+		errno = saved_errno;
+		return;
+	}
 
+	HOLD_INTERRUPTS();
 	PG_TRY();
 	{
-		qs_result = runtime_explain();
+		List       *qs_result;
+		TimestampTz now = GetCurrentTimestamp();
+
+		qs_context = AllocSetContextCreate(TopMemoryContext,
+										   "pg_query_state signal context",
+										   ALLOCSET_DEFAULT_SIZES);
+		oldcontext = MemoryContextSwitchTo(qs_context);
+
+		qs_result = runtime_explain(now);
 		qs_debug_node_stats(qs_result);
 		gpsc_qs_sync_config();
 		emit_node_batch(qs_result, qs_trace_slots[MyBackendId]);
 
-		if (Gp_role == GP_ROLE_DISPATCH)
+		if (Gp_role == GP_ROLE_DISPATCH &&
+			IsTransactionState() && CurrentResourceOwner != NULL)
 		{
 			bool	is_same_query;
 			bool	is_stale;
@@ -679,13 +719,12 @@ SendQueryState(void)
 
 			is_stale = !is_same_query ||
 				TimestampDifferenceExceeds(last_sent_query_key.at,
-										   GetCurrentTimestamp(),
+										   now,
 										   PLAN_DOC_RESEND_INTERVAL_MS);
 
 			if (is_stale)
 			{
-				char *plan_doc = build_plan_doc(get_toppest_query(),
-												EXPLAIN_FORMAT_JSON);
+				char *plan_doc = build_plan_doc(qd, EXPLAIN_FORMAT_JSON);
 
 				gpsc_emit_query_plan(tmid, gp_session_id, gp_command_count,
 									 plan_doc, EXPLAIN_FORMAT_JSON);
@@ -693,39 +732,82 @@ SendQueryState(void)
 				last_sent_query_key.tmid = tmid;
 				last_sent_query_key.ssid = gp_session_id;
 				last_sent_query_key.ccnt = gp_command_count;
-				last_sent_query_key.at   = GetCurrentTimestamp();
+				last_sent_query_key.at   = now;
 			}
 		}
 	}
 	PG_CATCH();
 	{
-		FlushErrorState();
+		MemoryContextSwitchTo(oldcontext);
+
+		if (!elog_dismiss(WARNING))
+		{
+			if (qs_context)
+				MemoryContextDelete(qs_context);
+			RESUME_INTERRUPTS();
+			errno = saved_errno;
+			PG_RE_THROW();
+		}
 	}
 	PG_END_TRY();
 
 	MemoryContextSwitchTo(oldcontext);
-	MemoryContextDelete(qs_context);
+	if (qs_context)
+		MemoryContextDelete(qs_context);
+	RESUME_INTERRUPTS();
+	errno = saved_errno;
 }
 
 /*
- * fill_segpid -- populate consecutive gp_segment_pid slots from one CDB segment.
+ * fill_segpid -- append (segid, pid) pairs from one CDB segment's activelist.
  *
- * Iterates the activelist of segInfo and fills msg->pids starting at *index,
- * incrementing *index for each entry.
+ * msg->pids[] has room for exactly 'cap' entries in total (not 'cap' more).
+ * *index is the running write position, shared across all calls for one
+ * message; it is advanced past every entry actually written.
+ *
+ * Entries are skipped when the descriptor has no live backend pid yet, or when
+ * it is the coordinator/entry-db (segindex == -1, which the QE list must not
+ * contain), so the final *index may be LESS than the capacity estimated by the
+ * caller. The caller must derive both msg->number and msg->length from the
+ * final *index, never from the estimate.
+ *
+ * Returns true if the capacity was hit and one or more writable entries were
+ * dropped.
  */
-static void
-fill_segpid(CdbComponentDatabaseInfo *segInfo, backend_info *msg, int *index)
+static bool
+fill_segpid(CdbComponentDatabaseInfo *segInfo, backend_info *msg, Size cap, Size *index)
 {
 	ListCell *lc;
+	gp_segment_pid *segpid;
+	SegmentDatabaseDescriptor *dbdesc;
 
 	foreach(lc, segInfo->activelist)
 	{
-		SegmentDatabaseDescriptor *dbdesc =
-			(SegmentDatabaseDescriptor *) lfirst(lc);
-		gp_segment_pid *segpid = &msg->pids[(*index)++];
+		dbdesc 		  = (SegmentDatabaseDescriptor *) lfirst(lc);
+		if (!dbdesc || dbdesc->backendPid <= 0 || dbdesc->segindex == -1)
+			continue;
+
+		if (*index >= cap)
+			return true;
+
+		segpid 		  = &msg->pids[(*index)++];
 		segpid->pid   = dbdesc->backendPid;
 		segpid->segid = dbdesc->segindex;
 	}
+
+	return false;
+}
+
+static int
+count_active(CdbComponentDatabaseInfo *dbs, Size n)
+{
+	int cnt = 0;
+	for (Size i = 0; i < n; ++i)
+	{
+		cnt += list_length(dbs[i].activelist);
+	}
+
+	return cnt;
 }
 
 /*
@@ -736,113 +818,131 @@ fill_segpid(CdbComponentDatabaseInfo *segInfo, backend_info *msg, int *index)
  * backend_info message.
  *
  * Side effects:
- *   - Calls cdbcomponent_getCdbComponents(), which may allocate memory.
- *   - All allocations are in a short-lived MemoryContext deleted on exit.
+ *   - Calls cdbcomponent_getCdbComponents(); the returned structure is owned
+ *     and cached by the CDB component cache (CdbComponentsContext), NOT by
+ *     the local context below, and must not be freed here.
+ *   - Only the locally built backend_info message is allocated in the
+ *     short-lived context, which is deleted on every exit path.
  */
 void
 SendCdbComponents(void)
 {
-	Assert(Gp_role == GP_ROLE_DISPATCH && "QD only function");
-
-	shm_mq_handle         *mqh = NULL;
+	int 				   saved_errno = errno;
+	shm_mq_handle         *volatile mqh = NULL;
 	CdbComponentDatabases *cdbs;
-	msg_by_parts_result   send_result;
-	MemoryContext         oldctx;
-	int                   index = 0;
-	MemoryContext         query_state_ctx =
-		AllocSetContextCreate(TopMemoryContext,
-							  "pg_query_state SendCdbComponents",
-							  ALLOCSET_DEFAULT_SIZES);
+	MemoryContext          volatile oldctx = CurrentMemoryContext;
+	MemoryContext		   volatile ctx = NULL;
+	Size                    index = 0;
+	msg_by_parts_result    send_result;
+
+	if (!mq || !params || !mq_req_id || Gp_role != GP_ROLE_DISPATCH)
+	{
+		errno = saved_errno;
+		return;
+	}
+
+	if (shm_mq_get_sender(mq) != MyProc || params->reason != BackendInfoPollReason)
+	{
+		errno = saved_errno;
+		return;
+	}
 
 	HOLD_INTERRUPTS();
-	oldctx = MemoryContextSwitchTo(query_state_ctx);
-
 	PG_TRY();
 	{
+		ctx = AllocSetContextCreate(TopMemoryContext,
+			"pg_query_state SendCdbComponents", ALLOCSET_DEFAULT_SIZES);
+		oldctx = MemoryContextSwitchTo(ctx);
+
 		mqh = shm_mq_attach(mq, NULL, NULL);
 
-		if (shm_mq_get_sender(mq) != MyProc ||
-			params->reason != BackendInfoPollReason)
-		{
-			elog(DEBUG1, "pg_query_state: SendCdbComponents: stale request, discarding");
-			shm_mq_detach(mqh);
-		}
-		else if (!pg_qs_enable)
+		if (!pg_qs_enable)
 		{
 			elog(DEBUG1, "pg_query_state: SendCdbComponents: module disabled");
 			shm_mq_msg disabled_msg = {*mq_req_id, BASE_SIZEOF_SHM_MQ_MSG,
 									   MyProc, STAT_DISABLED};
-			if (send_msg_by_parts(mqh, disabled_msg.length,
-								  &disabled_msg) != MSG_BY_PARTS_SUCCEEDED)
-				shm_mq_detach(mqh);
+			send_msg_by_parts(mqh, disabled_msg.length, &disabled_msg);
 		}
 		else if (list_length(QueryDescStack) == 0)
 		{
 			elog(DEBUG1, "pg_query_state: SendCdbComponents: no active query");
 			shm_mq_msg not_running_msg = {*mq_req_id, BASE_SIZEOF_SHM_MQ_MSG,
 										  MyProc, QUERY_NOT_RUNNING};
-			if (send_msg_by_parts(mqh, not_running_msg.length,
-								  &not_running_msg) != MSG_BY_PARTS_SUCCEEDED)
-				shm_mq_detach(mqh);
+			send_msg_by_parts(mqh, not_running_msg.length, &not_running_msg);
 		}
 		else
 		{
+			MemoryContextSwitchTo(oldctx);
 			cdbs = cdbcomponent_getCdbComponents();
+			MemoryContextSwitchTo(ctx);
 
-			/*
-			 * Size the buffer by the number of descriptors we will actually
-			 * emit -- the total length of every segment's activelist, which is
-			 * exactly what fill_segpid walks. cdbs->numActiveQEs is NOT that
-			 * count for every plan shape (a coordinator-heavy INSERT ... SELECT
-			 * leaves the activelists and numActiveQEs out of step): sizing by
-			 * numActiveQEs while filling by activelist overran the allocation
-			 * and produced a length the receiver rejected with "unexpected
-			 * message length". Deriving both length and ->number from the same
-			 * walk keeps them consistent and the write in bounds.
-			 */
-			int qecount = 0;
-			for (int i = 0; i < cdbs->total_segment_dbs; i++)
-				qecount += list_length(cdbs->segment_db_info[i].activelist);
+			int qecount = count_active(cdbs->entry_db_info, cdbs->total_entry_dbs)
+				+ count_active(cdbs->segment_db_info, cdbs->total_segment_dbs);
 
-			int msglen = BASE_SIZEOF_GP_BACKEND_INFO +
-						 sizeof(gp_segment_pid) * qecount;
-			backend_info *msg = (backend_info *) palloc0(msglen);
+			size_t bufsz = BASE_SIZEOF_GP_BACKEND_INFO + sizeof(gp_segment_pid) * qecount;
+			backend_info *msg = (backend_info *) palloc0(bufsz);
 
-			msg->reqid       = *mq_req_id;
-			msg->length      = msglen;
-			msg->result_code = QS_RETURNED;
+			bool truncated = false;
 
-			for (int i = 0; i < cdbs->total_segment_dbs; i++)
+			for (int i = 0; i < cdbs->total_segment_dbs; ++i)
 			{
 				CdbComponentDatabaseInfo *segInfo =
 					&cdbs->segment_db_info[i];
-				fill_segpid(segInfo, msg, &index);
+				truncated |= fill_segpid(segInfo, msg, qecount, &index);
 			}
-			Assert(index == qecount);
-			msg->number = index;
 
-			send_result = send_msg_by_parts(mqh, msglen, msg);
+			for (int i = 0; i < cdbs->total_entry_dbs; ++i)
+			{
+				CdbComponentDatabaseInfo *segInfo = &cdbs->entry_db_info[i];
+				truncated |= fill_segpid(segInfo, msg, qecount, &index);
+			}
+
+			if (truncated)
+			{
+				elog(WARNING, "pg_query_state: SendCdbComponents: backend list truncated at %d of %d entries",
+					 (int) index, qecount);
+			}
+
+			msg->reqid       = *mq_req_id;
+			msg->length      = BASE_SIZEOF_GP_BACKEND_INFO + sizeof(gp_segment_pid) * index;
+			msg->result_code = QS_RETURNED;
+			Assert(index <= qecount);
+			msg->number = index;
+			send_result = send_msg_by_parts(mqh, msg->length, msg);
 			if (send_result != MSG_BY_PARTS_SUCCEEDED)
-				shm_mq_detach(mqh);
+			{
+				elog(DEBUG1, "pg_query_state: SendCdbComponents: send failed (%d), receiver likely gone", 
+					(int) send_result);
+			}
 		}
+		shm_mq_detach(mqh);
+		mqh = NULL;
 	}
 	PG_CATCH();
 	{
-		elog(WARNING, "pg_query_state: SendCdbComponents: error during send");
+		if (mqh)
+		{
+			shm_mq_detach(mqh);
+			mqh = NULL;
+		}
+		MemoryContextSwitchTo(oldctx);
+
 		if (!elog_dismiss(WARNING))
 		{
-			if (mqh)
-				shm_mq_detach(mqh);
+			if (ctx)
+				MemoryContextDelete(ctx);
 
-			MemoryContextSwitchTo(oldctx);
-			MemoryContextDelete(query_state_ctx);
 			RESUME_INTERRUPTS();
+			errno = saved_errno;
 			PG_RE_THROW();
 		}
 	}
 	PG_END_TRY();
 
 	MemoryContextSwitchTo(oldctx);
-	MemoryContextDelete(query_state_ctx);
+	if (ctx)
+		MemoryContextDelete(ctx);
+
 	RESUME_INTERRUPTS();
+	errno = saved_errno;
 }

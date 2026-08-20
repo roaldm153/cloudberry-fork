@@ -155,12 +155,6 @@ typedef struct
 {
 	ProcSignalReason reason;
 	int     reqid;
-	bool    verbose;
-	bool    costs;
-	bool    timing;
-	bool    buffers;
-	bool    triggers;
-	ExplainFormat format;
 } pg_qs_params;
 
 /*
@@ -173,6 +167,7 @@ typedef struct QsWalkerContext
 	int32_t  parent_plan_node_id;
 	bool 	 finalize; /* true only in pg_qs_executor end */
 	TimestampTz ts_now;
+	int32_t  tmid;
 } QsWalkerContext;
 
 /*

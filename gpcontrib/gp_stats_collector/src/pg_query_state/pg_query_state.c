@@ -77,9 +77,6 @@
 #include "utils/portal.h"
 #include "utils/typcache.h"
 
-#define TEXT_CSTR_CMP(text, cstr) \
-	(memcmp(VARDATA(text), (cstr), VARSIZE(text) - VARHDRSZ))
-
 /* GUC variables */
 /* Master switch: disabling this suppresses all stat collection. */
 bool pg_qs_enable  = true;
@@ -158,6 +155,7 @@ static shm_mq_result receive_msg_by_parts(shm_mq_handle *mqh, Size *total,
 static PG_QS_RequestResult GetRemoteBackendInfo(PGPROC *proc, List **result);
 static void CollectQEQueryState(List *backendInfo, bytea *trace_id);
 static bool is_querystack_empty(void);
+static PG_QS_RequestResult qs_fetch_backend_info(PGPROC *proc, List **backend_info);
 
 #if PG_VERSION_NUM >= 150000
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
@@ -594,7 +592,6 @@ static void
 CollectQEQueryState(List *backendInfo, bytea *trace_id)
 {
 	ListCell       *lc;
-	int             index = 0;
 	StringInfoData  params_buf;
 	char           *sql;
 	char            trace_id_hex[2 * GPSC_TRACE_ID_LEN + 1];
@@ -607,10 +604,9 @@ CollectQEQueryState(List *backendInfo, bytea *trace_id)
 	foreach(lc, backendInfo)
 	{
 		gp_segment_pid *segpid = (gp_segment_pid *) lfirst(lc);
-		index++;
-		appendStringInfo(&params_buf, "'(%d,%d)'", segpid->segid, segpid->pid);
-		if (index != list_length(backendInfo))
+		if (lc != list_head(backendInfo))
 			appendStringInfoChar(&params_buf, ',');
+		appendStringInfo(&params_buf, "'(%d,%d)'", segpid->segid, segpid->pid);
 	}
 
 	hex_encode(VARDATA_ANY(trace_id), GPSC_TRACE_ID_LEN, trace_id_hex);
@@ -742,6 +738,36 @@ receive_msg_by_parts(shm_mq_handle *mqh, Size *total, void **datap,
 	return mq_receive_result;
 }
 
+/*
+ * qs_fetch_backend_info -- serialise a backend-info request and collect the
+ * (segid, pid) list for the query running on `proc`.
+ *
+ * Holds PG_QS_RCV_KEY across the request so concurrent requestors do not clobber
+ * the shared mq, releasing it on both the success and error paths.
+ */
+static PG_QS_RequestResult
+qs_fetch_backend_info(PGPROC *proc, List **backend_info)
+{
+	LOCKTAG             tag;
+	PG_QS_RequestResult result;
+
+	LockShmem(&tag, PG_QS_RCV_KEY);
+	PG_TRY();
+	{
+		reqid = *mq_req_id + 1;
+		result = GetRemoteBackendInfo(proc, backend_info);
+		UnlockShmem(&tag);
+	}
+	PG_CATCH();
+	{
+		UnlockShmem(&tag);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	return result;
+}
+
 /* SQL callable functions */
 /*
  * pg_query_state -- entry point for the pg_query_state() SQL function.
@@ -756,7 +782,6 @@ pg_query_state(PG_FUNCTION_ARGS)
 	pid_t                pid = PG_GETARG_INT32(0);
 	bytea               *trace_id = PG_GETARG_BYTEA_P(1);
 	PGPROC              *proc;
-	LOCKTAG              tag;
 	PG_QS_RequestResult  result;
 	List                *backend_info = NIL;
 
@@ -787,19 +812,7 @@ pg_query_state(PG_FUNCTION_ARGS)
 						errmsg("permission denied")));
 	}
 
-	LockShmem(&tag, PG_QS_RCV_KEY);
-	PG_TRY();
-	{
-		reqid = *mq_req_id + 1;
-		result = GetRemoteBackendInfo(proc, &backend_info);
-		UnlockShmem(&tag);
-	}
-	PG_CATCH();
-	{
-		UnlockShmem(&tag);
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
+	result = qs_fetch_backend_info(proc, &backend_info);
 
 	switch (result)
 	{
@@ -853,35 +866,14 @@ pg_query_state_backends(PG_FUNCTION_ARGS)
 	ReturnSetInfo       *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	TupleDesc            tupdesc;
 	Tuplestorestate     *tupstore;
-	MemoryContext        per_query_ctx;
-	MemoryContext        oldcontext;
 	PGPROC              *proc;
 	List                *backend_info = NIL;
-	LOCKTAG              tag;
 	PG_QS_RequestResult  info_result;
 	ListCell            *lc;
 
-	/* Standard set-returning-function materialize-mode preamble. */
-	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("set-valued function called in context that cannot accept a set")));
-	if (!(rsinfo->allowedModes & SFRM_Materialize))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("materialize mode required, but it is not allowed in this context")));
-	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("function returning record called in context that cannot accept type record")));
-
-	per_query_ctx = rsinfo->econtext->ecxt_per_query_memory;
-	oldcontext = MemoryContextSwitchTo(per_query_ctx);
-	tupstore = tuplestore_begin_heap(true, false, work_mem);
-	rsinfo->returnMode = SFRM_Materialize;
-	rsinfo->setResult = tupstore;
-	rsinfo->setDesc = tupdesc;
-	MemoryContextSwitchTo(oldcontext);
+	InitMaterializedSRF(fcinfo, 0);
+	tupdesc  = rsinfo->setDesc;
+	tupstore = rsinfo->setResult;
 
 	if (pid == MyProcPid)
 		ereport(ERROR,
@@ -908,19 +900,7 @@ pg_query_state_backends(PG_FUNCTION_ARGS)
 						errmsg("permission denied")));
 	}
 
-	LockShmem(&tag, PG_QS_RCV_KEY);
-	PG_TRY();
-	{
-		reqid = *mq_req_id + 1;
-		info_result = GetRemoteBackendInfo(proc, &backend_info);
-		UnlockShmem(&tag);
-	}
-	PG_CATCH();
-	{
-		UnlockShmem(&tag);
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
+	info_result = qs_fetch_backend_info(proc, &backend_info);
 
 	/* Not running / disabled: return an empty set rather than erroring. */
 	if (info_result != QS_RETURNED)
@@ -979,14 +959,6 @@ cbdb_mpp_query_state(PG_FUNCTION_ARGS)
 
 	if (alive_procs == NIL)
 		PG_RETURN_NULL();
-
-	/* Set request parameters for signal handler. */
-	params->verbose  = true;
-	params->costs    = true;
-	params->timing   = true;
-	params->buffers  = true;
-	params->triggers = false;
-	params->format   = EXPLAIN_FORMAT_JSON;
 
 	foreach(iter, alive_procs)
 	{
