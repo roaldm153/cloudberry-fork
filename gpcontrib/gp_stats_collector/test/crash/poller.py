@@ -92,6 +92,7 @@ def main():
     rounds = 0
     polls = 0
     errors = 0
+    logged_error = False  # print the first poll error body once, for diagnosis
     started = time.monotonic()
 
     print("poller: start (app_name={}, cooldown={}s)".format(APP_NAME, args.cooldown),
@@ -117,11 +118,18 @@ def main():
             trace_hex = secrets.token_hex(16)  # exactly 16 bytes -> bytea
             sql = ("SELECT gpsc.pg_query_state({pid}, '\\x{tid}'::bytea);"
                    .format(pid=pid, tid=trace_hex))
-            prc, _ = psql(args.dbname, sql, args.call_timeout)
+            prc, pout = psql(args.dbname, sql, args.call_timeout)
             last_polled[pid] = now
             polls += 1
             if prc != 0:
                 errors += 1  # gate/race/backend-gone: expected, not fatal here
+                if not logged_error:
+                    # A wall of errors usually means a setup problem (e.g. the
+                    # function is missing); surface the first one so the log is
+                    # not opaque.
+                    print("poller: first poll error: {}".format(pout.strip()),
+                          flush=True)
+                    logged_error = True
 
         if rounds % args.log_every == 0:
             print("poller: rounds={} polls={} errors={} tracked_pids={} elapsed={:.0f}s"

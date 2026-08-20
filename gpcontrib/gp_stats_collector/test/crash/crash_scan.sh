@@ -34,7 +34,9 @@ set -uo pipefail
 log_root="${1:?usage: crash_scan.sh <log-root>}"
 status=0
 
-# Unambiguous crash markers only.  Excluded on purpose:
+# Unambiguous crash markers only.  The workload (installcheck-parallel) injects
+# no faults, so a PANIC / signal here is a genuine crash, not a fault-injection
+# recovery test.  Excluded on purpose:
 #   - plain FATAL: routine during regression (missing role, duplicate object).
 #   - "server closed the connection unexpectedly" / "the database system is in
 #     recovery mode": routine mirror/walreceiver churn on every restart
