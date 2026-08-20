@@ -117,22 +117,6 @@ jobs:
             exit 1
           fi
 
-      - name: Match baseline EXPLAIN to the traced pass
-        shell: bash
-        run: |
-          set -eo pipefail
-          # The loaded extension turns on query-id computation, so EXPLAIN VERBOSE
-          # under tracing prints an extra "Query Identifier:" line that the stock
-          # baseline omits -- which would show up as dozens of tracing-only diffs
-          # that are pure cosmetics.  Turn query-id on for the baseline too, so
-          # both passes fail those tests identically and they cancel out of the
-          # delta, leaving only genuinely tracing-specific failures.
-          su - gpadmin -c "cd ${SRC_DIR} && \
-            source /usr/local/cloudberry-db/cloudberry-env.sh && \
-            source gpAux/gpdemo/gpdemo-env.sh && \
-            gpconfig -c compute_query_id -v on && \
-            gpstop -u"
-
       - name: 'Run 1: baseline installcheck-parallel (feature OFF)'
         shell: bash
         run: |
@@ -189,6 +173,7 @@ jobs:
             gpconfig -c gpsc.report_nested_queries -v on && \
             gpconfig -c gpsc.logging_mode -v UDS && \
             gpconfig -c gpsc.uds_path -v ${UDS_PATH} && \
+            gpconfig -c compute_query_id -v off && \
             gpstop -ar && \
             sleep 10"
 
