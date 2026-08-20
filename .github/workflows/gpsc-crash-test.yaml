@@ -116,6 +116,11 @@ jobs:
             echo "::error::Demo cluster creation failed"
             exit 1
           fi
+          su - gpadmin -c "cd ${SRC_DIR} && \
+            source /usr/local/cloudberry-db/cloudberry-env.sh && \
+            source gpAux/gpdemo/gpdemo-env.sh && \
+            gpconfig -c optimizer -v on && \
+            gpstop -ar"
 
       - name: 'Run 1: baseline installcheck-parallel (feature OFF)'
         shell: bash
