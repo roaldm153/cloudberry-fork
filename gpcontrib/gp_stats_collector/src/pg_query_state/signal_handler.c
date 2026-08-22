@@ -784,7 +784,7 @@ fill_segpid(CdbComponentDatabaseInfo *segInfo, backend_info *msg, Size cap, Size
 	foreach(lc, segInfo->activelist)
 	{
 		dbdesc 		  = (SegmentDatabaseDescriptor *) lfirst(lc);
-		if (!dbdesc || dbdesc->backendPid <= 0 || dbdesc->segindex == -1)
+		if (!dbdesc || dbdesc->backendPid <= 0 || dbdesc->segindex < 0)
 			continue;
 
 		if (*index >= cap)
@@ -886,8 +886,7 @@ SendCdbComponents(void)
 
 			for (int i = 0; i < cdbs->total_segment_dbs; ++i)
 			{
-				CdbComponentDatabaseInfo *segInfo =
-					&cdbs->segment_db_info[i];
+				CdbComponentDatabaseInfo *segInfo = &cdbs->segment_db_info[i];
 				truncated |= fill_segpid(segInfo, msg, qecount, &index);
 			}
 

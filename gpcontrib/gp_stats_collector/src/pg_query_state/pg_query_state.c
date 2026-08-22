@@ -868,7 +868,7 @@ pg_query_state_backends(PG_FUNCTION_ARGS)
 	Tuplestorestate     *tupstore;
 	PGPROC              *proc;
 	List                *backend_info = NIL;
-	PG_QS_RequestResult  info_result;
+	PG_QS_RequestResult  result;
 	ListCell            *lc;
 
 	InitMaterializedSRF(fcinfo, 0);
@@ -900,10 +900,10 @@ pg_query_state_backends(PG_FUNCTION_ARGS)
 						errmsg("permission denied")));
 	}
 
-	info_result = qs_fetch_backend_info(proc, &backend_info);
+	result = qs_fetch_backend_info(proc, &backend_info);
 
 	/* Not running / disabled: return an empty set rather than erroring. */
-	if (info_result != QS_RETURNED)
+	if (result != QS_RETURNED)
 		return (Datum) 0;
 
 	foreach(lc, backend_info)
