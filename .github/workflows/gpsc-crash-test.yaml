@@ -39,12 +39,11 @@ name: GPSC Crash Test
 
 on:
   push:
-    branches:
-      - pgqs-proto-uds-sandbox
+    branches: [REL_2_STABLE]
+  pull_request:
+    branches: [REL_2_STABLE]
+    types: [opened, synchronize, reopened, edited]
   workflow_dispatch:
-  schedule:
-    # Nightly at 02:30 UTC.
-    - cron: '30 2 * * *'
 
 permissions:
   contents: read
