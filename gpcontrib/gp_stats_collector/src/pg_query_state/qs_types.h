@@ -35,6 +35,22 @@
 #define MAX_RELNAME_LEN 64
 
 /*
+ * parent_plan_node_id of a root node.  Not 0: plan_node_id counters start at 0
+ * (setrefs.c, and GPORCA's GetNextPlanId), so 0 is always a real node.
+ */
+#define GPSC_NO_PARENT_PLAN_NODE_ID (-1)
+
+/*
+ * Negative segids reported in per-node samples and in the participant list.
+ * Real segments report GpIdentity.segindex, which is >= 0.  On the coordinator
+ * host it is -1 for the QD and for the entry-db QE alike, so the entry-db is
+ * re-stamped: consumers key their dedup and their barrier on this value, and
+ * two backends sharing it means one of them is silently dropped.
+ */
+#define GPSC_SEGID_QD       (-1)
+#define GPSC_SEGID_ENTRY_DB (-2)
+
+/*
  * Execution phase of a single plan node as observed at signal time.
  */
 typedef enum QsNodeStatus
@@ -51,7 +67,8 @@ typedef struct GpscNodeSample
 	int32_t ssid;                    /* gp_session_id */
 	int32_t ccnt;                    /* gp_command_count */
 	int32_t plan_node_id;            /* Plan.plan_node_id */
-	int32_t parent_plan_node_id;     /* plan_node_id of logical parent */
+	int32_t parent_plan_node_id;     /* parent's plan_node_id, or
+									  * GPSC_NO_PARENT_PLAN_NODE_ID at the root */
 	int32_t node_tag;                /* nodeTag(plan) */
 	int32_t slice_id;                /* currentSliceId */
 	int32_t segindex;                /* GpIdentity.segindex */

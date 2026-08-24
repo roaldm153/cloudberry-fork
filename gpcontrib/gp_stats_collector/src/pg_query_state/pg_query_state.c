@@ -154,6 +154,7 @@ static shm_mq_result receive_msg_by_parts(shm_mq_handle *mqh, Size *total,
 										  int *rc, bool nowait);
 static PG_QS_RequestResult GetRemoteBackendInfo(PGPROC *proc, List **result);
 static void CollectQEQueryState(List *backendInfo, bytea *trace_id);
+static void SignalEntryDbBackends(List *backendInfo, bytea *trace_id);
 static bool is_querystack_empty(void);
 static PG_QS_RequestResult qs_fetch_backend_info(PGPROC *proc, List **backend_info);
 
@@ -583,10 +584,15 @@ GetRemoteBackendInfo(PGPROC *proc, List **result)
 }
 
 /*
- * CollectQEQueryState -- fan-out query-state signals to all QE backends.
+ * CollectQEQueryState -- fan-out query-state signals to the segment QEs.
  *
  * Dispatches a cbdb_mpp_query_state() call to each segment listed in
  * backendInfo.  Results are returned as raw CdbPgResults.
+ *
+ * GPSC_SEGID_ENTRY_DB entries are left out: the dispatch reaches primary
+ * segments only, and there the receiving cbdb_mpp_query_state() matches
+ * entries against its own GpIdentity.segindex, which is never negative.
+ * SignalEntryDbBackends() handles those.
  */
 static void
 CollectQEQueryState(List *backendInfo, bytea *trace_id)
@@ -595,6 +601,7 @@ CollectQEQueryState(List *backendInfo, bytea *trace_id)
 	StringInfoData  params_buf;
 	char           *sql;
 	char            trace_id_hex[2 * GPSC_TRACE_ID_LEN + 1];
+	int             nsegments = 0;
 
 	if (list_length(backendInfo) == 0)
 		return;
@@ -604,9 +611,19 @@ CollectQEQueryState(List *backendInfo, bytea *trace_id)
 	foreach(lc, backendInfo)
 	{
 		gp_segment_pid *segpid = (gp_segment_pid *) lfirst(lc);
-		if (lc != list_head(backendInfo))
+
+		if (segpid->segid < 0)
+			continue;
+
+		if (nsegments++ > 0)
 			appendStringInfoChar(&params_buf, ',');
 		appendStringInfo(&params_buf, "'(%d,%d)'", segpid->segid, segpid->pid);
+	}
+
+	if (nsegments == 0)
+	{
+		pfree(params_buf.data);
+		return;
 	}
 
 	hex_encode(VARDATA_ANY(trace_id), GPSC_TRACE_ID_LEN, trace_id_hex);
@@ -617,6 +634,40 @@ CollectQEQueryState(List *backendInfo, bytea *trace_id)
 	CdbDispatchCommand(sql, DF_NONE, NULL);
 	pfree(params_buf.data);
 	pfree(sql);
+}
+
+/*
+ * SignalEntryDbBackends -- poll the entry-db QEs listed in backendInfo.
+ *
+ * An entry-db reader runs the coordinator-side slice of a distributed query and
+ * so holds the only instrumentation for it, but it lives in the coordinator's
+ * own postmaster and no dispatch reaches it.  Since it is a local backend, the
+ * QD signals it the same way it signals itself.
+ */
+static void
+SignalEntryDbBackends(List *backendInfo, bytea *trace_id)
+{
+	ListCell *lc;
+
+	foreach(lc, backendInfo)
+	{
+		gp_segment_pid *segpid = (gp_segment_pid *) lfirst(lc);
+		PGPROC         *proc;
+
+		if (segpid->segid != GPSC_SEGID_ENTRY_DB)
+			continue;
+
+		proc = BackendPidGetProc(segpid->pid);
+		if (!proc || proc->backendId == InvalidBackendId)
+			continue;
+
+		memcpy(qs_trace_slots[proc->backendId], VARDATA_ANY(trace_id),
+			   GPSC_TRACE_ID_LEN);
+		if (SendProcSignal(proc->pid, QueryStatePollReason,
+						   proc->backendId) == -1)
+			elog(DEBUG1, "pg_query_state: failed to signal entry-db backend pid=%d",
+				 segpid->pid);
+	}
 }
 
 /*
@@ -824,6 +875,17 @@ pg_query_state(PG_FUNCTION_ARGS)
 			elog(DEBUG1, "pg_query_state: stats collection disabled");
 			break;
 
+		case WRONG_ROLE:
+			/*
+			 * Not the QD, so there is no participant list to fan out to and no
+			 * point signalling: a QE polled directly would report a single
+			 * slice that no collection is waiting for.  Stay quiet here -- the
+			 * caller-facing complaint belongs to pg_query_state_backends(),
+			 * which errors out on the same result code.
+			 */
+			elog(DEBUG1, "pg_query_state: pid=%d is a query executor, not the QD", pid);
+			break;
+
 		case QS_RETURNED:
 			/*
 			 * Signal all segment QEs to push their plan-node stats via UDS,
@@ -831,6 +893,7 @@ pg_query_state(PG_FUNCTION_ARGS)
 			 * key this pg_query_state() invocation owns.
 			 */
 			CollectQEQueryState(backend_info, trace_id);
+			SignalEntryDbBackends(backend_info, trace_id);
 
 			/*
 			 * Signal the QD backend itself so it pushes coordinator-side plan
@@ -902,9 +965,33 @@ pg_query_state_backends(PG_FUNCTION_ARGS)
 
 	result = qs_fetch_backend_info(proc, &backend_info);
 
-	/* Not running / disabled: return an empty set rather than erroring. */
-	if (result != QS_RETURNED)
-		return (Datum) 0;
+	/*
+	 * Not running / disabled are ordinary outcomes of polling a pid that has
+	 * just finished: return an empty set rather than erroring.  A wrong-role
+	 * target is different -- the backend is alive and will never answer, which
+	 * a caller must be able to tell apart from a finished query, so that one
+	 * does error out.
+	 */
+	switch (result)
+	{
+		case QUERY_NOT_RUNNING:
+			elog(DEBUG1, "pg_query_state_backends: pid=%d is not running a query", pid);
+			return (Datum) 0;
+
+		case STAT_DISABLED:
+			elog(DEBUG1, "pg_query_state_backends: stats collection disabled");
+			return (Datum) 0;
+
+		case WRONG_ROLE:
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("backend with pid=%d is a query executor, "
+							"not the session's coordinator backend", pid)));
+			break;
+
+		case QS_RETURNED:
+			break;
+	}
 
 	foreach(lc, backend_info)
 	{
@@ -921,15 +1008,15 @@ pg_query_state_backends(PG_FUNCTION_ARGS)
 	 * QD-only query (INSERT ... VALUES, catalog reads, and other coordinator-
 	 * local plans): no QE gang ran, so backend_info is empty even though the
 	 * coordinator is executing and will push its own per-node batch.  Report the
-	 * coordinator itself (segindex -1) so the caller does not mistake an empty
-	 * QE list for a finished query and drop the QD's batch.
+	 * coordinator itself so the caller does not mistake an empty QE list for a
+	 * finished query and drop the QD's batch.
 	 */
 	if (list_length(backend_info) == 0)
 	{
 		Datum   values[2];
 		bool    nulls[2] = {false, false};
 
-		values[0] = Int32GetDatum(GpIdentity.segindex);
+		values[0] = Int32GetDatum(GPSC_SEGID_QD);
 		values[1] = Int32GetDatum(proc->pid);
 		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
 	}

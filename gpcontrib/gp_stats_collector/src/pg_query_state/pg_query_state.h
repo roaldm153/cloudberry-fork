@@ -102,7 +102,10 @@ typedef enum
 {
 	QUERY_NOT_RUNNING,   /* backend is idle or has no active QueryDesc */
 	STAT_DISABLED,       /* pg_query_state.enable = false */
-	QS_RETURNED          /* handler successfully collected and sent stats */
+	QS_RETURNED,         /* handler successfully collected and sent stats */
+	WRONG_ROLE           /* target is a QE, not the QD: only GP_ROLE_DISPATCH
+						  * knows the participant list, so no other backend can
+						  * answer BackendInfoPollReason */
 } PG_QS_RequestResult;
 
 /*
@@ -165,6 +168,7 @@ typedef struct QsWalkerContext
 {
 	List    *per_node_stats;
 	int32_t  parent_plan_node_id;
+	int32_t  slice_id;  /* slice owning the node being visited */
 	bool 	 finalize; /* true only in pg_qs_executor end */
 	TimestampTz ts_now;
 	int32_t  tmid;

@@ -130,6 +130,21 @@ void gpsc_reset_node_roll_state(void)
 }
 
 /*
+ * qs_reporting_segid -- segid this backend stamps on the samples it emits.
+ *
+ * GpIdentity.segindex is -1 both here and on the QD; an executor role on the
+ * coordinator host means the entry-db QE, which needs a segid of its own.
+ */
+static int32
+qs_reporting_segid(void)
+{
+	if (Gp_role == GP_ROLE_EXECUTE && GpIdentity.segindex < 0)
+		return GPSC_SEGID_ENTRY_DB;
+
+	return GpIdentity.segindex;
+}
+
+/*
  * shm_mq_send_nonblocking -- attempt to send nbytes through mqh up to
  * `attempts` times, sleeping WRITING_DELAY µs between retries.
  *
@@ -228,6 +243,7 @@ qs_planstate_walker(PlanState *planstate,
 					int depth)
 {
 	int32     saved_parent_plan_node_id;
+	int32     saved_slice_id;
 	Plan     *plan;
 	ListCell *lc;
 
@@ -237,6 +253,22 @@ qs_planstate_walker(PlanState *planstate,
 	check_stack_depth();
 
 	plan = planstate->plan;
+
+	/*
+	 * A Motion opens a new slice, and the node itself belongs to the sending
+	 * side -- the same attribution ExplainNode() uses.  Switch before sampling
+	 * so the Motion is reported under its own slice, not its parent's.
+	 */
+	saved_slice_id = qs_walker_ctx->slice_id;
+	if (IsA(plan, Motion))
+	{
+		Motion     *motion = (Motion *) plan;
+		SliceTable *sliceTable = planstate->state->es_sliceTable;
+
+		if (sliceTable && motion->motionID >= 0 &&
+			motion->motionID < sliceTable->numSlices)
+			qs_walker_ctx->slice_id = sliceTable->slices[motion->motionID].sliceIndex;
+	}
 
 	executor(planstate, qs_walker_ctx);
 	saved_parent_plan_node_id = qs_walker_ctx->parent_plan_node_id;
@@ -311,6 +343,7 @@ qs_planstate_walker(PlanState *planstate,
 	}
 
 	qs_walker_ctx->parent_plan_node_id = saved_parent_plan_node_id;
+	qs_walker_ctx->slice_id = saved_slice_id;
 }
 
 /*
@@ -339,8 +372,8 @@ qs_get_node_stats(PlanState *planstate, QsWalkerContext *qs_walker_ctx)
 	nodestat->plan_node_id        = planstate->plan->plan_node_id;
 	nodestat->parent_plan_node_id = qs_walker_ctx->parent_plan_node_id;
 	nodestat->node_tag            = nodeTag(planstate->plan);
-	nodestat->slice_id            = currentSliceId;
-	nodestat->segindex            = GpIdentity.segindex;
+	nodestat->slice_id            = qs_walker_ctx->slice_id;
+	nodestat->segindex            = qs_reporting_segid();
 	nodestat->dbid                = GpIdentity.dbid;
 	nodestat->pid                 = MyProcPid;
 
@@ -557,6 +590,10 @@ runtime_explain(TimestampTz ts_now)
 	Assert(list_length(QueryDescStack) > 0);
 	queryDesc = get_toppest_query();
 	qs_walker_ctx->ts_now = ts_now;
+	qs_walker_ctx->parent_plan_node_id = GPSC_NO_PARENT_PLAN_NODE_ID;
+	qs_walker_ctx->slice_id = queryDesc->estate
+		? LocallyExecutingSliceIndex(queryDesc->estate)
+		: currentSliceId;
 	gp_gettmid(&qs_walker_ctx->tmid);
 	ensure_node_roll_htab();
 	qs_planstate_walker(queryDesc->planstate, qs_get_node_stats,
@@ -765,17 +802,21 @@ SendQueryState(void)
  * *index is the running write position, shared across all calls for one
  * message; it is advanced past every entry actually written.
  *
- * Entries are skipped when the descriptor has no live backend pid yet, or when
- * it is the coordinator/entry-db (segindex == -1, which the QE list must not
- * contain), so the final *index may be LESS than the capacity estimated by the
- * caller. The caller must derive both msg->number and msg->length from the
- * final *index, never from the estimate.
+ * Entries are skipped when the descriptor has no live backend pid yet, so the
+ * final *index may be LESS than the capacity estimated by the caller. The
+ * caller must derive both msg->number and msg->length from the final *index,
+ * never from the estimate.
+ *
+ * `is_entry_db` selects which of cdbs->{segment_db_info,entry_db_info} the
+ * caller is walking.  An entry-db descriptor carries segindex -1, the same
+ * value the QD itself reports, so its entries go out as GPSC_SEGID_ENTRY_DB.
  *
  * Returns true if the capacity was hit and one or more writable entries were
  * dropped.
  */
 static bool
-fill_segpid(CdbComponentDatabaseInfo *segInfo, backend_info *msg, Size cap, Size *index)
+fill_segpid(CdbComponentDatabaseInfo *segInfo, backend_info *msg, Size cap,
+			Size *index, bool is_entry_db)
 {
 	ListCell *lc;
 	gp_segment_pid *segpid;
@@ -784,7 +825,10 @@ fill_segpid(CdbComponentDatabaseInfo *segInfo, backend_info *msg, Size cap, Size
 	foreach(lc, segInfo->activelist)
 	{
 		dbdesc 		  = (SegmentDatabaseDescriptor *) lfirst(lc);
-		if (!dbdesc || dbdesc->backendPid <= 0 || dbdesc->segindex < 0)
+		if (!dbdesc || dbdesc->backendPid <= 0)
+			continue;
+
+		if (!is_entry_db && dbdesc->segindex < 0)
 			continue;
 
 		if (*index >= cap)
@@ -792,7 +836,7 @@ fill_segpid(CdbComponentDatabaseInfo *segInfo, backend_info *msg, Size cap, Size
 
 		segpid 		  = &msg->pids[(*index)++];
 		segpid->pid   = dbdesc->backendPid;
-		segpid->segid = dbdesc->segindex;
+		segpid->segid = is_entry_db ? GPSC_SEGID_ENTRY_DB : dbdesc->segindex;
 	}
 
 	return false;
@@ -833,15 +877,15 @@ SendCdbComponents(void)
 	MemoryContext          volatile oldctx = CurrentMemoryContext;
 	MemoryContext		   volatile ctx = NULL;
 	Size                    index = 0;
-	msg_by_parts_result    send_result;
+	msg_by_parts_result    send_result = MSG_BY_PARTS_SUCCEEDED;
 
-	if (!mq || !params || !mq_req_id || Gp_role != GP_ROLE_DISPATCH)
+	if (!mq || shm_mq_get_sender(mq) != MyProc || !mq_req_id)
 	{
 		errno = saved_errno;
 		return;
 	}
 
-	if (shm_mq_get_sender(mq) != MyProc || params->reason != BackendInfoPollReason)
+	if (!params || params->reason != BackendInfoPollReason)
 	{
 		errno = saved_errno;
 		return;
@@ -856,19 +900,26 @@ SendCdbComponents(void)
 
 		mqh = shm_mq_attach(mq, NULL, NULL);
 
-		if (!pg_qs_enable)
+		if (Gp_role != GP_ROLE_DISPATCH)
+		{
+			elog(DEBUG1, "pg_query_state: SendCdbComponents: running not on QD");
+			shm_mq_msg error_msg = {*mq_req_id, BASE_SIZEOF_SHM_MQ_MSG,
+										  MyProc, WRONG_ROLE};
+			send_result = send_msg_by_parts(mqh, error_msg.length, &error_msg);
+		}
+		else if (!pg_qs_enable)
 		{
 			elog(DEBUG1, "pg_query_state: SendCdbComponents: module disabled");
 			shm_mq_msg disabled_msg = {*mq_req_id, BASE_SIZEOF_SHM_MQ_MSG,
 									   MyProc, STAT_DISABLED};
-			send_msg_by_parts(mqh, disabled_msg.length, &disabled_msg);
+			send_result = send_msg_by_parts(mqh, disabled_msg.length, &disabled_msg);
 		}
 		else if (list_length(QueryDescStack) == 0)
 		{
 			elog(DEBUG1, "pg_query_state: SendCdbComponents: no active query");
 			shm_mq_msg not_running_msg = {*mq_req_id, BASE_SIZEOF_SHM_MQ_MSG,
 										  MyProc, QUERY_NOT_RUNNING};
-			send_msg_by_parts(mqh, not_running_msg.length, &not_running_msg);
+			send_result = send_msg_by_parts(mqh, not_running_msg.length, &not_running_msg);
 		}
 		else
 		{
@@ -887,13 +938,13 @@ SendCdbComponents(void)
 			for (int i = 0; i < cdbs->total_segment_dbs; ++i)
 			{
 				CdbComponentDatabaseInfo *segInfo = &cdbs->segment_db_info[i];
-				truncated |= fill_segpid(segInfo, msg, qecount, &index);
+				truncated |= fill_segpid(segInfo, msg, qecount, &index, false);
 			}
 
 			for (int i = 0; i < cdbs->total_entry_dbs; ++i)
 			{
 				CdbComponentDatabaseInfo *segInfo = &cdbs->entry_db_info[i];
-				truncated |= fill_segpid(segInfo, msg, qecount, &index);
+				truncated |= fill_segpid(segInfo, msg, qecount, &index, true);
 			}
 
 			if (truncated)
@@ -908,12 +959,14 @@ SendCdbComponents(void)
 			Assert(index <= qecount);
 			msg->number = index;
 			send_result = send_msg_by_parts(mqh, msg->length, msg);
-			if (send_result != MSG_BY_PARTS_SUCCEEDED)
-			{
-				elog(DEBUG1, "pg_query_state: SendCdbComponents: send failed (%d), receiver likely gone", 
-					(int) send_result);
-			}
 		}
+
+		if (send_result != MSG_BY_PARTS_SUCCEEDED)
+		{
+			elog(DEBUG1, "pg_query_state: SendCdbComponents: send failed (%d)", 
+				(int) send_result);
+		}
+
 		shm_mq_detach(mqh);
 		mqh = NULL;
 	}

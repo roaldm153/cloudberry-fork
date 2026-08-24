@@ -66,7 +66,9 @@ The sequence diagram lives in
 status (`INITIALIZED`/`EXECUTING`/`FINISHED`, `eof`), and C-side derived rates
 (`ntuples_delta`, `tuples_per_sec`, `time_since_init_sec`, `stalled`). The rates
 come from a per-node rolling state keyed by `plan_node_id`, reset on executor
-start and end.
+start and end. The walk root reports `parent = -1`
+(`GPSC_NO_PARENT_PLAN_NODE_ID`); `0` would be ambiguous, since `plan_node_id`
+counters start there.
 
 ## Permissions
 
