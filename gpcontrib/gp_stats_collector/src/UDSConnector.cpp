@@ -28,7 +28,6 @@
 #include "UDSConnector.h"
 #include "Config.h"
 #include "GpscStat.h"
-#include "log/LogOps.h"
 #include "memory/gpdbwrappers.h"
 
 #include <string>
