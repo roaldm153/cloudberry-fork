@@ -20,9 +20,9 @@
  * pg_query_state.h
  *		Public API for the pg_query_state signal-dispatch layer.
  *
- * This header is included by both the C extension entry point
- * (gp_stats_collector.c) and the C++ hook wrappers (hook_wrappers.cpp).
- * Keep it C-compatible: no C++ types, wrapped in extern "C".
+ * This header is included by the C extension entry point (gp_stats_collector.c),
+ * which only has to call pg_qs_init(); everything else the module needs it
+ * registers itself.  Keep it C-compatible: no C++ types, wrapped in extern "C".
  *
  * Portions derived from pg_query_state
  * (https://github.com/postgrespro/pg_query_state), under the PostgreSQL
@@ -208,19 +208,11 @@ extern ProcSignalReason QueryStatePollReason;
 extern ProcSignalReason BackendInfoPollReason;
 
 /*
- * pg_qs_init -- register shared memory, custom signals and GUC variables.
- * Must be called from _PG_init() during shared_preload_libraries processing.
+ * pg_qs_init -- register shared memory, custom signals, GUC variables and the
+ * executor hooks.  Must be called from _PG_init() during
+ * shared_preload_libraries processing.
  */
 extern void pg_qs_init(void);
-
-/* Executor lifecycle hooks -- called from hook_wrappers.cpp. */
-extern void pg_qs_executor_start(QueryDesc *queryDesc, int eflags);
-extern void pg_qs_executor_run(QueryDesc *queryDesc);
-extern void pg_qs_executor_finish(QueryDesc *queryDesc);
-extern void pg_qs_executor_end(QueryDesc *queryDesc);
-
-/* Pops the QueryDesc pushed by executor_run/finish; called from hook_wrappers.cpp. */
-extern void pg_qs_pop_query(void);
 
 /* Custom signal handlers registered with RegisterCustomProcSignalHandler. */
 extern void SendQueryState(void);

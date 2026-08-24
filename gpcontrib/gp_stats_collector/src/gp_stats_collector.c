@@ -49,14 +49,16 @@ PG_FUNCTION_INFO_V1(gpsc_test_uds_stop_server);
 void
 _PG_init(void)
 {
-	/*
-	 * Initialise the pg_query_state signal infrastructure unconditionally.
-	 * It registers custom ProcSignal handlers and shared memory that must be
-	 * set up during shared_preload_libraries processing.
-	 */
-	pg_qs_init();
 	if (Gp_role == GP_ROLE_DISPATCH || Gp_role == GP_ROLE_EXECUTE)
 		hooks_init();
+
+	/*
+	 * pg_query_state registers its own shared memory, ProcSignal handlers and
+	 * executor hooks.  It goes last on purpose: hooks are chained head-first,
+	 * so registering after hooks_init() puts it outside of the collector's
+	 * executor wrappers, which is what it needs to see an untouched QueryDesc.
+	 */
+	pg_qs_init();
 }
 
 void

@@ -48,19 +48,23 @@ An extension for collecting query execution metrics and reporting them to an ext
 
 ### Runtime Query State (`pg_query_state`)
 
-On-demand inspection of the live execution state of another running backend. The target's active plan tree is walked across the coordinator (QD) and every segment (QE), collecting per-node instrumentation, without waiting for the query to finish. This is the signal-only variant: per-node samples are written to the server log rather than sent to the UDS sink.
+On-demand inspection of the live execution state of another running backend. The target's active plan tree is walked across the coordinator (QD) and every segment (QE), collecting per-node instrumentation, without waiting for the query to finish. Each backend pushes its own snapshot to the UDS sink configured by `gpsc.uds_path`, keyed by the caller-supplied `trace_id`.
+
+Delivery is best-effort, exactly like the rest of the extension: a snapshot that does not fit into the socket is dropped rather than retried, so a slow or absent reader never adds latency to the query being observed.
 
 The functions live in the `gpsc` schema (extension version 1.2).
 
-#### 1. `pg_query_state(pid)`
--   **What:** Triggers runtime per-node collection for the query running on backend `pid`. Fans a poll out to every participating QE and to the QD; each backend walks its plan tree and logs a per-node snapshot. Fire-and-forget: returns `void`.
+#### 1. `pg_query_state(pid, trace_id)`
+-   **What:** Triggers runtime per-node collection for the query running on backend `pid`. Fans a poll out to every participating QE and to the QD; each backend walks its plan tree and pushes one per-node batch. The coordinator additionally pushes the deparsed plan document, rate-limited so that repeated polls of a long query do not resend an unchanged plan. Fire-and-forget: returns `void`.
+-   **Arguments:** `trace_id` is a `bytea` of exactly 16 bytes, minted by the caller and used as the collection key on the receiving side.
+-   **Executes on:** the coordinator only.
 -   **GUC:** `pg_query_state.enable`.
 
 #### 2. `pg_query_state_backends(pid)`
--   **What:** Lists the QE backends participating in the query running on backend `pid`, as `(segid, pid)` rows. Returns an empty set when the target is not running a query or has the module disabled.
+-   **What:** Lists the QE backends participating in the query running on backend `pid`, as `(segid, pid)` rows, so that a collector knows how many batches to expect. A coordinator-only query (`INSERT ... VALUES`, catalog reads) allocates no gang, and is reported as a single row for the coordinator itself with `segid < 0`. Returns an empty set when the target is not running a query or has the module disabled.
 -   **GUC:** `pg_query_state.enable`.
 
-#### 3. `cbdb_mpp_query_state(gp_segment_pid[])`
+#### 3. `cbdb_mpp_query_state(gp_segment_pid[], trace_id)`
 -   **What:** QE-side dispatch target used internally by `pg_query_state()`; not intended for direct use.
 
 ### Runtime Query State Configuration

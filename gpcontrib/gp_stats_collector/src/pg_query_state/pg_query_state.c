@@ -26,8 +26,9 @@
  *       QueryStatePollReason  -> SendQueryState()
  *       BackendInfoPollReason -> SendCdbComponents()
  *   - GUC variables: pg_query_state.enable / enable_timing / enable_buffers.
- *   - Executor lifecycle hooks (start/run/finish/end) that maintain the
- *     QueryDescStack and enable instrumentation on the top-level query.
+ *   - Executor hooks (start/run/finish/end), registered by this module itself,
+ *     that maintain the QueryDescStack and enable instrumentation on the
+ *     top-level query.
  *   - A requestor-side helper: shm_mq_receive_with_timeout().
  *
  * Per-node stats are pushed to the yagpcc UDS sink on demand, when a backend is
@@ -96,6 +97,12 @@ static int qs_push_count = 0;
 /* Saved hook pointer for chaining shmem_startup callbacks. */
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 
+/* Saved hook pointers for chaining the executor callbacks. */
+static ExecutorStart_hook_type  prev_ExecutorStart_hook  = NULL;
+static ExecutorRun_hook_type    prev_ExecutorRun_hook    = NULL;
+static ExecutorFinish_hook_type prev_ExecutorFinish_hook = NULL;
+static ExecutorEnd_hook_type    prev_ExecutorEnd_hook    = NULL;
+
 /* Whether pg_qs_shmem_startup has completed successfully. */
 static bool module_initialized = false;
 
@@ -145,7 +152,13 @@ ProcSignalReason BackendInfoPollReason = INVALID_PROCSIGNAL;
 static Size pg_qs_shmem_size(void);
 static void pg_qs_shmem_startup(void);
 static void push_query(QueryDesc *queryDesc);
+static void pg_qs_pop_query(void);
 static bool filter_query(QueryDesc *queryDesc);
+static void pg_qs_executor_start(QueryDesc *queryDesc, int eflags);
+static void pg_qs_executor_run(QueryDesc *queryDesc, ScanDirection direction,
+							   uint64 count, bool execute_once);
+static void pg_qs_executor_finish(QueryDesc *queryDesc);
+static void pg_qs_executor_end(QueryDesc *queryDesc);
 static shm_mq_result shm_mq_receive_with_timeout(shm_mq_handle *mqh, Size *nbytesp,
 												 void **datap, int64 timeout);
 static List *get_query_backend_info(ArrayType *array);
@@ -319,6 +332,24 @@ pg_qs_init(void)
 	prev_shmem_startup_hook = shmem_startup_hook;
 	shmem_startup_hook = pg_qs_shmem_startup;
 
+	/*
+	 * Own the executor hooks rather than being called from the collector's
+	 * wrappers: this module has to run outside of whatever else hooks the
+	 * executor, because pg_qs_executor_start() only instruments a query whose
+	 * showstatctx is still unset, and gp_stats_collector allocates one itself
+	 * when gpsc.enable_analyze and gpsc.enable_cdbstats are on.  A hook is
+	 * pushed onto the head of the chain, so registering last means running
+	 * first -- see _PG_init() in gp_stats_collector.c.
+	 */
+	prev_ExecutorStart_hook  = ExecutorStart_hook;
+	ExecutorStart_hook       = pg_qs_executor_start;
+	prev_ExecutorRun_hook    = ExecutorRun_hook;
+	ExecutorRun_hook         = pg_qs_executor_run;
+	prev_ExecutorFinish_hook = ExecutorFinish_hook;
+	ExecutorFinish_hook      = pg_qs_executor_finish;
+	prev_ExecutorEnd_hook    = ExecutorEnd_hook;
+	ExecutorEnd_hook         = pg_qs_executor_end;
+
 	elog(LOG, "pg_query_state: signal infrastructure initialised");
 }
 
@@ -340,7 +371,7 @@ pg_qs_init(void)
  *   queryDesc  -- the QueryDesc being started
  *   eflags     -- executor flags (EXEC_FLAG_EXPLAIN_ONLY etc.)
  */
-void
+static void
 pg_qs_executor_start(QueryDesc *queryDesc, int eflags)
 {
 	instr_time starttime;
@@ -378,29 +409,60 @@ pg_qs_executor_start(QueryDesc *queryDesc, int eflags)
 	if (queryDesc->plannedstmt->queryId == 0)
 		queryDesc->plannedstmt->queryId =
 			((uint64) gp_command_count << 32) + qs_push_count;
+
+	if (prev_ExecutorStart_hook)
+		prev_ExecutorStart_hook(queryDesc, eflags);
+	else
+		standard_ExecutorStart(queryDesc, eflags);
 }
 
 /*
  * pg_qs_executor_run -- called when the executor begins fetching tuples.
  *
- * Pushes the QueryDesc onto the stack so signal handlers can find it.
+ * Keeps the QueryDesc on the stack for as long as tuples are being fetched, so
+ * that a poll arriving mid-run finds it.
  */
-void
-pg_qs_executor_run(QueryDesc *queryDesc)
+static void
+pg_qs_executor_run(QueryDesc *queryDesc, ScanDirection direction,
+				   uint64 count, bool execute_once)
 {
 	push_query(queryDesc);
+	PG_TRY();
+	{
+		if (prev_ExecutorRun_hook)
+			prev_ExecutorRun_hook(queryDesc, direction, count, execute_once);
+		else
+			standard_ExecutorRun(queryDesc, direction, count, execute_once);
+	}
+	PG_FINALLY();
+	{
+		pg_qs_pop_query();
+	}
+	PG_END_TRY();
 }
 
 /*
  * pg_qs_executor_finish -- called after all tuples have been fetched.
  *
- * Pushes the QueryDesc again to keep the stack consistent during the finish
- * phase (needed so signal handlers still see the query during cleanup).
+ * Same push/pop as the run phase: the query stays visible to signal handlers
+ * while after-triggers and the like are still running.
  */
-void
+static void
 pg_qs_executor_finish(QueryDesc *queryDesc)
 {
 	push_query(queryDesc);
+	PG_TRY();
+	{
+		if (prev_ExecutorFinish_hook)
+			prev_ExecutorFinish_hook(queryDesc);
+		else
+			standard_ExecutorFinish(queryDesc);
+	}
+	PG_FINALLY();
+	{
+		pg_qs_pop_query();
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -410,11 +472,16 @@ pg_qs_executor_finish(QueryDesc *queryDesc)
  * delta accounting clean.  It does not collect or push anything: a finish is not
  * a signalled collection and carries no trace_id to key a batch under.
  */
-void
+static void
 pg_qs_executor_end(QueryDesc *queryDesc)
 {
 	if (queryDesc && pg_qs_enable)
 		gpsc_reset_node_roll_state();
+
+	if (prev_ExecutorEnd_hook)
+		prev_ExecutorEnd_hook(queryDesc);
+	else
+		standard_ExecutorEnd(queryDesc);
 }
 
 static void
@@ -424,13 +491,7 @@ push_query(QueryDesc *queryDesc)
 	QueryDescStack = lcons(queryDesc, QueryDescStack);
 }
 
-/*
- * pg_qs_pop_query -- remove the most-recently-pushed QueryDesc from the stack.
- *
- * Non-static: the ExecutorRun/Finish wrappers in hook_wrappers.cpp call it to
- * balance the push done by pg_qs_executor_run/finish.
- */
-void
+static void
 pg_qs_pop_query(void)
 {
 	QueryDescStack = list_delete_first(QueryDescStack);
