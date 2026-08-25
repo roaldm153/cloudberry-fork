@@ -29,6 +29,7 @@
 #include "Config.h"
 #include "GpscStat.h"
 #include "memory/gpdbwrappers.h"
+#include "pg_query_state/qs_types.h"
 
 #include <string>
 #include <sys/fcntl.h>
@@ -152,19 +153,24 @@ static const uint16_t kRequestTypeQueryPlan = 2;
 static void inline log_tracing_failure(const yagpcc::SetPerNodeBatchReq &req)
 {
 	static const char hexchars[] = "0123456789abcdef";
-	const std::string &trace_id = req.trace_id();
-	std::string hex;
+	const unsigned char *trace_id =
+		reinterpret_cast<const unsigned char *>(req.trace_id().data());
+	size_t len = req.trace_id().size();
+	char hex[GPSC_TRACE_ID_LEN * 2 + 1];
 
-	hex.reserve(trace_id.size() * 2);
-	for (unsigned char c : trace_id)
+	if (len > GPSC_TRACE_ID_LEN)
+		len = GPSC_TRACE_ID_LEN;
+
+	for (size_t i = 0; i < len; ++i)
 	{
-		hex.push_back(hexchars[c >> 4]);
-		hex.push_back(hexchars[c & 0x0f]);
+		hex[i * 2] = hexchars[trace_id[i] >> 4];
+		hex[i * 2 + 1] = hexchars[trace_id[i] & 0x0f];
 	}
+	hex[len * 2] = '\0';
 
 	ereport(LOG,
 			(errmsg("Per-node batch {%s} tracing of %d nodes failed with error %m",
-					hex.c_str(), req.nodes_size())));
+					hex, req.nodes_size())));
 }
 
 static void inline log_tracing_failure(const yagpcc::SetQueryPlanReq &req)
